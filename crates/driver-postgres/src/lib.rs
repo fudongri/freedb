@@ -1,0 +1,225 @@
+use async_trait::async_trait;
+use core_domain::{
+    AppError, AppResult, ColumnDefinition, ConnectionProfile, ExplorerNode, ExplorerNodeType,
+    QueryCellValue, QueryExecution, QueryResult, TableChangeSet, TableDefinition, TableRef,
+};
+use driver_api::{ConnectionHandle, ConnectionProvider, DatabaseDriver};
+use std::collections::BTreeMap;
+use std::time::Instant;
+use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
+
+#[derive(Clone, Default)]
+pub struct PostgresDriver;
+
+#[async_trait]
+impl ConnectionProvider for PostgresDriver {
+    async fn connect(
+        &self,
+        profile: &ConnectionProfile,
+        password: &str,
+        database: Option<&str>,
+    ) -> AppResult<ConnectionHandle> {
+        let db = database
+            .or(profile.default_database.as_deref())
+            .unwrap_or("postgres");
+        let conn_str = format!(
+            "host={} port={} user={} password={} dbname={}",
+            profile.host, profile.port, profile.username, password, db
+        );
+        let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+            .await
+            .map_err(map_pg_error)?;
+        let handle = tokio::spawn(async move { let _ = connection.await; });
+        Ok(ConnectionHandle::Postgres { client, connection: handle })
+    }
+
+    async fn ping(&self, handle: &mut ConnectionHandle) -> AppResult<()> {
+        match handle {
+            ConnectionHandle::Postgres { client, .. } => {
+                client.simple_query("SELECT 1").await.map_err(map_pg_error)?;
+                Ok(())
+            }
+            _ => Err(AppError::Validation("expected postgres handle".into())),
+        }
+    }
+}
+
+#[async_trait]
+impl DatabaseDriver for PostgresDriver {
+    async fn test_connection(&self, profile: &ConnectionProfile, password: &str) -> AppResult<()> {
+        let mut handle = self.connect(profile, password, None).await?;
+        self.ping(&mut handle).await
+    }
+
+    async fn list_roots(&self, profile: &ConnectionProfile, password: &str) -> AppResult<Vec<ExplorerNode>> {
+        let (client, conn) = open_client(profile, password, None).await?;
+        let rows = client
+            .query("SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname", &[])
+            .await
+            .map_err(map_pg_error)?;
+        conn.abort();
+        Ok(rows.into_iter().map(|row| {
+            let db: String = row.get(0);
+            ExplorerNode {
+                id: format!("pg-db:{}:{db}", profile.id),
+                connection_id: profile.id.clone(),
+                name: db.clone(),
+                node_type: ExplorerNodeType::Database,
+                parent_id: None,
+                database: Some(db),
+                schema: None,
+                expandable: true,
+                loaded: false,
+            }
+        }).collect())
+    }
+
+    async fn list_children(&self, profile: &ConnectionProfile, password: &str, parent: &ExplorerNode) -> AppResult<Vec<ExplorerNode>> {
+        if matches!(parent.node_type, ExplorerNodeType::Connection) {
+            return self.list_roots(profile, password).await;
+        }
+        match parent.node_type {
+            ExplorerNodeType::Database => {
+                let db = parent.database.clone().ok_or_else(|| AppError::Validation("missing database".into()))?;
+                let (client, conn) = open_client(profile, password, Some(db.clone())).await?;
+                let rows = client.query(
+                    "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('information_schema', 'pg_catalog') ORDER BY schema_name", &[],
+                ).await.map_err(map_pg_error)?;
+                conn.abort();
+                Ok(rows.into_iter().map(|row| {
+                    let schema: String = row.get(0);
+                    ExplorerNode {
+                        id: format!("pg-schema:{}:{db}:{schema}", profile.id),
+                        connection_id: profile.id.clone(),
+                        name: schema.clone(),
+                        node_type: ExplorerNodeType::Schema,
+                        parent_id: Some(parent.id.clone()),
+                        database: Some(db.clone()),
+                        schema: Some(schema),
+                        expandable: true,
+                        loaded: false,
+                    }
+                }).collect())
+            }
+            ExplorerNodeType::Schema => {
+                let db = parent.database.clone().ok_or_else(|| AppError::Validation("missing database".into()))?;
+                let schema = parent.schema.clone().ok_or_else(|| AppError::Validation("missing schema".into()))?;
+                let (client, conn) = open_client(profile, password, Some(db.clone())).await?;
+                let rows = client.query(
+                    "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = $1 ORDER BY table_name",
+                    &[&schema],
+                ).await.map_err(map_pg_error)?;
+                conn.abort();
+                Ok(rows.into_iter().map(|row| {
+                    let name: String = row.get(0);
+                    let kind: String = row.get(1);
+                    let is_view = kind.eq_ignore_ascii_case("VIEW");
+                    ExplorerNode {
+                        id: format!("pg-table:{}:{db}:{schema}:{name}", profile.id),
+                        connection_id: profile.id.clone(),
+                        name: name.clone(),
+                        node_type: if is_view { ExplorerNodeType::View } else { ExplorerNodeType::Table },
+                        parent_id: Some(parent.id.clone()),
+                        database: Some(db.clone()),
+                        schema: Some(schema.clone()),
+                        expandable: false,
+                        loaded: true,
+                    }
+                }).collect())
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    async fn load_table_definition(&self, profile: &ConnectionProfile, password: &str, table: &TableRef) -> AppResult<TableDefinition> {
+        let db = table.database.clone().or_else(|| profile.default_database.clone()).unwrap_or_else(|| "postgres".into());
+        let schema = table.schema.clone().unwrap_or_else(|| "public".into());
+        let (client, conn) = open_client(profile, password, Some(db)).await?;
+        let rows = client.query(
+            "SELECT c.column_name, c.data_type, c.is_nullable,
+                    EXISTS (SELECT 1 FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema WHERE tc.table_schema = c.table_schema AND tc.table_name = c.table_name AND tc.constraint_type = 'PRIMARY KEY' AND kcu.column_name = c.column_name) AS is_primary
+             FROM information_schema.columns c WHERE c.table_schema = $1 AND c.table_name = $2 ORDER BY c.ordinal_position",
+            &[&schema, &table.table],
+        ).await.map_err(map_pg_error)?;
+        let columns = rows.into_iter().map(|row| ColumnDefinition {
+            name: row.get(0), data_type: row.get(1),
+            nullable: row.get::<_, String>(2).eq_ignore_ascii_case("YES"),
+            primary_key: row.get(3),
+        }).collect();
+        let create_sql = if table.is_view {
+            client.query_one("SELECT pg_get_viewdef($1::regclass, true)", &[&format!("{schema}.{}", table.table)])
+                .await.ok().map(|row| row.get::<_, String>(0))
+        } else { None };
+        conn.abort();
+        Ok(TableDefinition { columns, create_sql })
+    }
+
+    async fn preview_table(&self, profile: &ConnectionProfile, password: &str, table: &TableRef, limit: u32) -> AppResult<QueryResult> {
+        let db = table.database.clone().or_else(|| profile.default_database.clone()).unwrap_or_else(|| "postgres".into());
+        let schema = table.schema.clone().unwrap_or_else(|| "public".into());
+        let sql = format!("SELECT * FROM {}.{} LIMIT {}", quote_pg(&schema), quote_pg(&table.table), limit);
+        let (client, conn) = open_client(profile, password, Some(db)).await?;
+        let result = simple_query(&client, &sql).await;
+        conn.abort();
+        result
+    }
+
+    async fn execute_sql(&self, profile: &ConnectionProfile, password: &str, execution: QueryExecution) -> AppResult<QueryResult> {
+        let db = execution.database.or_else(|| profile.default_database.clone()).unwrap_or_else(|| "postgres".into());
+        let (client, conn) = open_client(profile, password, Some(db)).await?;
+        let result = simple_query(&client, execution.sql.trim()).await;
+        conn.abort();
+        result
+    }
+
+    async fn apply_table_changes(&self, _profile: &ConnectionProfile, _password: &str, _changes: TableChangeSet) -> AppResult<QueryResult> {
+        Err(AppError::Unsupported("PostgreSQL 表格编辑将在后续迭代中补全".into()))
+    }
+}
+
+// ── helpers ──
+
+async fn open_client(profile: &ConnectionProfile, password: &str, database: Option<String>) -> AppResult<(Client, tokio::task::JoinHandle<()>)> {
+    let db = database.or_else(|| profile.default_database.clone()).unwrap_or_else(|| "postgres".into());
+    let conn_str = format!("host={} port={} user={} password={} dbname={}", profile.host, profile.port, profile.username, password, db);
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await.map_err(map_pg_error)?;
+    let handle = tokio::spawn(async move { let _ = connection.await; });
+    Ok((client, handle))
+}
+
+async fn simple_query(client: &Client, sql: &str) -> AppResult<QueryResult> {
+    let start = Instant::now();
+    let messages = client.simple_query(sql).await.map_err(map_pg_error)?;
+    let mut columns = Vec::new();
+    let mut rows = Vec::new();
+    let mut affected_rows = None;
+    let mut message = None;
+    for item in messages {
+        match item {
+            SimpleQueryMessage::Row(row) => {
+                if columns.is_empty() {
+                    columns = row.columns().iter().map(|c| c.name().to_string()).collect();
+                }
+                let mut mapped = BTreeMap::new();
+                for (i, col) in columns.iter().enumerate() {
+                    mapped.insert(col.clone(), pg_cell(row.get(i)));
+                }
+                rows.push(mapped);
+            }
+            SimpleQueryMessage::CommandComplete(n) => { affected_rows = Some(n); message = Some("语句执行成功".into()); }
+            _ => {}
+        }
+    }
+    Ok(QueryResult { columns, rows, affected_rows, elapsed_ms: start.elapsed().as_millis(), message })
+}
+
+fn pg_cell(value: Option<&str>) -> QueryCellValue {
+    match value {
+        Some(t) => QueryCellValue::Text(t.to_string()),
+        None => QueryCellValue::Null,
+    }
+}
+
+fn quote_pg(s: &str) -> String { format!("\"{}\"", s.replace('"', "\"\"")) }
+
+fn map_pg_error(e: tokio_postgres::Error) -> AppError { AppError::Connection(e.to_string()) }

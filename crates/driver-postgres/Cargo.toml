@@ -1,0 +1,15 @@
+[package]
+name = "driver-postgres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+core-domain = { path = "../core-domain" }
+driver-api = { path = "../driver-api" }
+native-tls.workspace = true
+postgres-native-tls.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true

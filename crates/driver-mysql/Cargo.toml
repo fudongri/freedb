@@ -1,0 +1,13 @@
+[package]
+name = "driver-mysql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+core-domain = { path = "../core-domain" }
+driver-api = { path = "../driver-api" }
+mysql_async.workspace = true
+tokio.workspace = true

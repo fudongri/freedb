@@ -1,0 +1,28 @@
+[package]
+name = "desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "freedb"
+path = "src/main.rs"
+
+[[bin]]
+name = "export-icon"
+path = "src/bin/export_icon.rs"
+
+[dependencies]
+app-services = { path = "../../crates/app-services" }
+core-domain = { path = "../../crates/core-domain" }
+eframe.workspace = true
+egui.workspace = true
+egui_dock.workspace = true
+egui_extras.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }
+rfd.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+unicode-width = "0.2"
