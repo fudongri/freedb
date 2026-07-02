@@ -28,7 +28,7 @@ rm -rf "$ICONSET_DIR"
 echo "Icon generated: $ASSETS_DIR/freedb-icon.icns"
 
 echo "=== Building macOS DMG ==="
-cargo bundle -p desktop --bin freedb --release --format dmg
+~/.cargo/bin/cargo bundle -p desktop --bin freedb --release --format dmg
 
 # cargo-bundle may not embed resources; rebuild DMG with icon injected
 DMG="target/release/bundle/dmg/FreeDB.dmg"
