@@ -7599,13 +7599,11 @@ async fn check_for_update() -> Option<UpdateInfo> {
 
 impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        // 首帧延迟最大化：Windows 上用原生 ShowWindow 直接最大化，
-        // macOS 上用 ViewportCommand。egui/winit 的 with_maximized(true)
-        // 会导致 winit 内部最大化状态与实际窗口不同步——窗口实际未最大化
-        // 但 winit 认为已最大化，导致第一次点最大化按钮变成"还原"（无变化），
-        // 第二次才真正最大化。
+        // 首帧即把窗口设为最大化。Windows 上用 ShowWindow(SW_MAXIMIZE)，
+        // 窗口还在 hidden 状态时执行无闪烁且系统自动处理边框补偿。
+        // macOS 上用 ViewportCommand。
         self.frame_count += 1;
-        if self.frame_count == 3 {
+        if self.frame_count == 1 {
             #[cfg(target_os = "windows")]
             {
                 use raw_window_handle::HasWindowHandle;
@@ -7613,10 +7611,10 @@ impl eframe::App for DesktopApp {
                     if let raw_window_handle::RawWindowHandle::Win32(h) = handle.as_raw() {
                         let hwnd = h.hwnd.get() as isize;
                         unsafe {
-                            // SW_MAXIMIZE = 3
                             unsafe extern "system" {
                                 fn ShowWindow(hwnd: isize, nCmdShow: i32) -> i32;
                             }
+                            // SW_MAXIMIZE = 3，窗口还在 hidden 状态，无闪烁
                             ShowWindow(hwnd, 3);
                         }
                     }
