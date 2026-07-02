@@ -24,6 +24,7 @@ i18n = { path = "../../crates/i18n" }
 image = { version = "0.25", default-features = false, features = ["png"] }
 muda.workspace = true
 open = "5"
+raw-window-handle.workspace = true
 regex.workspace = true
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 rfd.workspace = true

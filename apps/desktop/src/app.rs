@@ -7610,6 +7610,7 @@ impl eframe::App for DesktopApp {
                 #[cfg(target_os = "windows")]
                 {
                     use raw_window_handle::HasWindowHandle;
+                    use muda::ContextMenu;
                     if let Ok(handle) = frame.window_handle() {
                         if let raw_window_handle::RawWindowHandle::Win32(h) = handle.as_raw() {
                             let hwnd = h.hwnd.get() as isize;

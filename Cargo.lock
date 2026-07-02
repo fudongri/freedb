@@ -1128,6 +1128,7 @@ dependencies = [
  "image",
  "muda",
  "open",
+ "raw-window-handle",
  "regex",
  "reqwest",
  "rfd",
