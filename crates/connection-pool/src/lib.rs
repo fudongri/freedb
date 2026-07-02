@@ -8,7 +8,15 @@ use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::sleep;
 
-/// 连接池 —— 缓存已建立的连接，复用前 ping 验证，不健康自动重连。
+fn pool_key(profile_id: &str, database: Option<&str>) -> String {
+    match database {
+        Some(db) => format!("{profile_id}::{db}"),
+        None => format!("{profile_id}::__no_db__"),
+    }
+}
+
+/// 连接池 —— 缓存已建立的连接，按 profile + database 独立缓存，
+/// 复用前 ping 验证，不健康自动重连。
 pub struct ConnectionPool {
     entries: Arc<std::sync::Mutex<HashMap<String, Arc<AsyncMutex<ConnectionHandle>>>>>,
     pub postgres: PostgresDriver,
@@ -35,7 +43,7 @@ impl ConnectionPool {
         }
     }
 
-    /// 获取一个健康的连接句柄
+    /// 获取一个健康的连接句柄。database 影响 pool key，确保不同 database 的连接独立缓存。
     pub async fn acquire(
         &self,
         profile: &ConnectionProfile,
@@ -47,11 +55,10 @@ impl ConnectionPool {
             .map_err(|e| AppError::Validation(e.to_string()))?;
 
         let provider = self.provider(profile.kind);
-        let key = &profile.id;
+        let key = pool_key(&profile.id, database);
 
-        // 检查缓存 —— std::sync::Mutex::lock() 的 guard 是 Send
-        let cached = self.entries.lock().unwrap().get(key).cloned();
-        drop(self.entries.lock().unwrap()); // guard explicitly dropped
+        let cached = self.entries.lock().unwrap().get(&key).cloned();
+        drop(self.entries.lock().unwrap());
 
         if let Some(handle) = cached {
             let mut guard = handle.lock().await;
@@ -59,20 +66,18 @@ impl ConnectionPool {
                 return Ok(handle.clone());
             }
             drop(guard);
-            self.entries.lock().unwrap().remove(key);
+            self.entries.lock().unwrap().remove(&key);
         }
 
-        // 新建连接
         let new = provider.connect(profile, password, database).await?;
         let handle = Arc::new(AsyncMutex::new(new));
         self.entries
             .lock()
             .unwrap()
-            .insert(profile.id.clone(), handle.clone());
+            .insert(key, handle.clone());
         Ok(handle)
     }
 
-    /// 获取所有缓存 entry 的快照
     fn entry_snapshot(&self) -> Vec<(String, Arc<AsyncMutex<ConnectionHandle>>)> {
         self.entries
             .lock()
@@ -82,19 +87,19 @@ impl ConnectionPool {
             .collect()
     }
 
-    /// 驱逐连接
+    /// 驱逐某 connection 的所有 db 缓存
     pub fn evict(&self, connection_id: &str) {
-        self.entries.lock().unwrap().remove(connection_id);
+        self.entries
+            .lock()
+            .unwrap()
+            .retain(|k, _| !k.starts_with(connection_id));
     }
 
-    /// 全部断开
     pub fn disconnect_all(&self) {
         self.entries.lock().unwrap().clear();
     }
 
-    /// 启动后台 keepalive（仅当 tokio runtime 已运行时才生效）
     pub fn start_keepalive(self: &Arc<Self>) {
-        // 仅在 tokio runtime 存在时启动
         if tokio::runtime::Handle::try_current().is_ok() {
             let pool = Arc::downgrade(self);
             let interval = self.keepalive_secs;

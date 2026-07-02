@@ -30,14 +30,19 @@ impl ConnectionProvider for PostgresDriver {
         let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
             .await
             .map_err(map_pg_error)?;
-        let handle = tokio::spawn(async move { let _ = connection.await; });
+        let handle = tokio::spawn(async move {
+            let _ = connection.await;
+        });
         Ok(ConnectionHandle::Postgres { client, connection: handle })
     }
 
     async fn ping(&self, handle: &mut ConnectionHandle) -> AppResult<()> {
         match handle {
             ConnectionHandle::Postgres { client, .. } => {
-                client.simple_query("SELECT 1").await.map_err(map_pg_error)?;
+                client
+                    .simple_query("SELECT 1")
+                    .await
+                    .map_err(map_pg_error)?;
                 Ok(())
             }
             _ => Err(AppError::Validation("expected postgres handle".into())),
@@ -47,146 +52,234 @@ impl ConnectionProvider for PostgresDriver {
 
 #[async_trait]
 impl DatabaseDriver for PostgresDriver {
-    async fn test_connection(&self, profile: &ConnectionProfile, password: &str) -> AppResult<()> {
+    async fn test_connection(
+        &self,
+        profile: &ConnectionProfile,
+        password: &str,
+    ) -> AppResult<()> {
         let mut handle = self.connect(profile, password, None).await?;
         self.ping(&mut handle).await
     }
 
-    async fn list_roots(&self, profile: &ConnectionProfile, password: &str) -> AppResult<Vec<ExplorerNode>> {
-        let (client, conn) = open_client(profile, password, None).await?;
+    async fn list_roots(
+        &self,
+        handle: &mut ConnectionHandle,
+        connection_id: &str,
+    ) -> AppResult<Vec<ExplorerNode>> {
+        let client = pg_client(handle)?;
         let rows = client
-            .query("SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname", &[])
+            .query(
+                "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname",
+                &[],
+            )
             .await
             .map_err(map_pg_error)?;
-        conn.abort();
-        Ok(rows.into_iter().map(|row| {
-            let db: String = row.get(0);
-            ExplorerNode {
-                id: format!("pg-db:{}:{db}", profile.id),
-                connection_id: profile.id.clone(),
-                name: db.clone(),
-                node_type: ExplorerNodeType::Database,
-                parent_id: None,
-                database: Some(db),
-                schema: None,
-                expandable: true,
-                loaded: false,
-            }
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let db: String = row.get(0);
+                ExplorerNode {
+                    id: format!("pg-db:{connection_id}:{db}"),
+                    connection_id: connection_id.to_string(),
+                    name: db.clone(),
+                    node_type: ExplorerNodeType::Database,
+                    parent_id: None,
+                    database: Some(db),
+                    schema: None,
+                    expandable: true,
+                    loaded: false,
+                }
+            })
+            .collect())
     }
 
-    async fn list_children(&self, profile: &ConnectionProfile, password: &str, parent: &ExplorerNode) -> AppResult<Vec<ExplorerNode>> {
+    async fn list_children(
+        &self,
+        handle: &mut ConnectionHandle,
+        connection_id: &str,
+        parent: &ExplorerNode,
+    ) -> AppResult<Vec<ExplorerNode>> {
         if matches!(parent.node_type, ExplorerNodeType::Connection) {
-            return self.list_roots(profile, password).await;
+            return self.list_roots(handle, connection_id).await;
         }
         match parent.node_type {
             ExplorerNodeType::Database => {
-                let db = parent.database.clone().ok_or_else(|| AppError::Validation("missing database".into()))?;
-                let (client, conn) = open_client(profile, password, Some(db.clone())).await?;
-                let rows = client.query(
-                    "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('information_schema', 'pg_catalog') ORDER BY schema_name", &[],
-                ).await.map_err(map_pg_error)?;
-                conn.abort();
-                Ok(rows.into_iter().map(|row| {
-                    let schema: String = row.get(0);
-                    ExplorerNode {
-                        id: format!("pg-schema:{}:{db}:{schema}", profile.id),
-                        connection_id: profile.id.clone(),
-                        name: schema.clone(),
-                        node_type: ExplorerNodeType::Schema,
-                        parent_id: Some(parent.id.clone()),
-                        database: Some(db.clone()),
-                        schema: Some(schema),
-                        expandable: true,
-                        loaded: false,
-                    }
-                }).collect())
+                let db = parent
+                    .database
+                    .clone()
+                    .ok_or_else(|| AppError::Validation("missing database".into()))?;
+                let client = pg_client(handle)?;
+                let rows = client
+                    .query(
+                        "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('information_schema', 'pg_catalog') ORDER BY schema_name",
+                        &[],
+                    )
+                    .await
+                    .map_err(map_pg_error)?;
+                Ok(rows
+                    .into_iter()
+                    .map(|row| {
+                        let schema: String = row.get(0);
+                        ExplorerNode {
+                            id: format!("pg-schema:{connection_id}:{db}:{schema}"),
+                            connection_id: connection_id.to_string(),
+                            name: schema.clone(),
+                            node_type: ExplorerNodeType::Schema,
+                            parent_id: Some(parent.id.clone()),
+                            database: Some(db.clone()),
+                            schema: Some(schema),
+                            expandable: true,
+                            loaded: false,
+                        }
+                    })
+                    .collect())
             }
             ExplorerNodeType::Schema => {
-                let db = parent.database.clone().ok_or_else(|| AppError::Validation("missing database".into()))?;
-                let schema = parent.schema.clone().ok_or_else(|| AppError::Validation("missing schema".into()))?;
-                let (client, conn) = open_client(profile, password, Some(db.clone())).await?;
-                let rows = client.query(
-                    "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = $1 ORDER BY table_name",
-                    &[&schema],
-                ).await.map_err(map_pg_error)?;
-                conn.abort();
-                Ok(rows.into_iter().map(|row| {
-                    let name: String = row.get(0);
-                    let kind: String = row.get(1);
-                    let is_view = kind.eq_ignore_ascii_case("VIEW");
-                    ExplorerNode {
-                        id: format!("pg-table:{}:{db}:{schema}:{name}", profile.id),
-                        connection_id: profile.id.clone(),
-                        name: name.clone(),
-                        node_type: if is_view { ExplorerNodeType::View } else { ExplorerNodeType::Table },
-                        parent_id: Some(parent.id.clone()),
-                        database: Some(db.clone()),
-                        schema: Some(schema.clone()),
-                        expandable: false,
-                        loaded: true,
-                    }
-                }).collect())
+                let db = parent
+                    .database
+                    .clone()
+                    .ok_or_else(|| AppError::Validation("missing database".into()))?;
+                let schema = parent
+                    .schema
+                    .clone()
+                    .ok_or_else(|| AppError::Validation("missing schema".into()))?;
+                let client = pg_client(handle)?;
+                let rows = client
+                    .query(
+                        "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = $1 ORDER BY table_name",
+                        &[&schema],
+                    )
+                    .await
+                    .map_err(map_pg_error)?;
+                Ok(rows
+                    .into_iter()
+                    .map(|row| {
+                        let name: String = row.get(0);
+                        let kind: String = row.get(1);
+                        let is_view = kind.eq_ignore_ascii_case("VIEW");
+                        ExplorerNode {
+                            id: format!("pg-table:{connection_id}:{db}:{schema}:{name}"),
+                            connection_id: connection_id.to_string(),
+                            name: name.clone(),
+                            node_type: if is_view {
+                                ExplorerNodeType::View
+                            } else {
+                                ExplorerNodeType::Table
+                            },
+                            parent_id: Some(parent.id.clone()),
+                            database: Some(db.clone()),
+                            schema: Some(schema.clone()),
+                            expandable: false,
+                            loaded: true,
+                        }
+                    })
+                    .collect())
             }
             _ => Ok(Vec::new()),
         }
     }
 
-    async fn load_table_definition(&self, profile: &ConnectionProfile, password: &str, table: &TableRef) -> AppResult<TableDefinition> {
-        let db = table.database.clone().or_else(|| profile.default_database.clone()).unwrap_or_else(|| "postgres".into());
+    async fn load_table_definition(
+        &self,
+        handle: &mut ConnectionHandle,
+        table: &TableRef,
+    ) -> AppResult<TableDefinition> {
         let schema = table.schema.clone().unwrap_or_else(|| "public".into());
-        let (client, conn) = open_client(profile, password, Some(db)).await?;
-        let rows = client.query(
-            "SELECT c.column_name, c.data_type, c.is_nullable,
-                    EXISTS (SELECT 1 FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema WHERE tc.table_schema = c.table_schema AND tc.table_name = c.table_name AND tc.constraint_type = 'PRIMARY KEY' AND kcu.column_name = c.column_name) AS is_primary,
-                    c.column_default,
-                    col_description((c.table_schema||'.'||c.table_name)::regclass::oid, c.ordinal_position::int) AS col_comment
-             FROM information_schema.columns c WHERE c.table_schema = $1 AND c.table_name = $2 ORDER BY c.ordinal_position",
-            &[&schema, &table.table],
-        ).await.map_err(map_pg_error)?;
-        let columns = rows.into_iter().map(|row| {
-            let default_val: Option<String> = row.try_get::<_, String>(4).ok().filter(|v| !v.is_empty());
-            let is_auto = default_val.as_deref().map(|d| d.starts_with("nextval(")).unwrap_or(false);
-            ColumnDefinition {
-                name: row.get(0), data_type: row.get(1),
-                nullable: row.get::<_, String>(2).eq_ignore_ascii_case("YES"),
-                primary_key: row.get(3),
-                auto_increment: is_auto,
-                default_value: default_val,
-                comment: row.try_get::<_, String>(5).ok().filter(|v| !v.is_empty()),
-            }
-        }).collect();
+        let client = pg_client(handle)?;
+        let rows = client
+            .query(
+                "SELECT c.column_name, c.data_type, c.is_nullable,
+                        EXISTS (SELECT 1 FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema WHERE tc.table_schema = c.table_schema AND tc.table_name = c.table_name AND tc.constraint_type = 'PRIMARY KEY' AND kcu.column_name = c.column_name) AS is_primary,
+                        c.column_default,
+                        col_description((c.table_schema||'.'||c.table_name)::regclass::oid, c.ordinal_position::int) AS col_comment
+                 FROM information_schema.columns c WHERE c.table_schema = $1 AND c.table_name = $2 ORDER BY c.ordinal_position",
+                &[&schema, &table.table],
+            )
+            .await
+            .map_err(map_pg_error)?;
+        let columns = rows
+            .into_iter()
+            .map(|row| {
+                let default_val: Option<String> =
+                    row.try_get::<_, String>(4).ok().filter(|v| !v.is_empty());
+                let is_auto = default_val
+                    .as_deref()
+                    .map(|d| d.starts_with("nextval("))
+                    .unwrap_or(false);
+                ColumnDefinition {
+                    name: row.get(0),
+                    data_type: row.get(1),
+                    nullable: row.get::<_, String>(2).eq_ignore_ascii_case("YES"),
+                    primary_key: row.get(3),
+                    auto_increment: is_auto,
+                    default_value: default_val,
+                    comment: row.try_get::<_, String>(5).ok().filter(|v| !v.is_empty()),
+                }
+            })
+            .collect();
         let create_sql = if table.is_view {
-            client.query_one("SELECT pg_get_viewdef($1::regclass, true)", &[&format!("{schema}.{}", table.table)])
-                .await.ok().map(|row| row.get::<_, String>(0))
-        } else { None };
-        conn.abort();
+            client
+                .query_one(
+                    "SELECT pg_get_viewdef($1::regclass, true)",
+                    &[&format!("{schema}.{}", table.table)],
+                )
+                .await
+                .ok()
+                .map(|row| row.get::<_, String>(0))
+        } else {
+            None
+        };
         Ok(TableDefinition { columns, create_sql })
     }
 
-    async fn preview_table(&self, profile: &ConnectionProfile, password: &str, table: &TableRef, limit: u32) -> AppResult<QueryResult> {
-        let db = table.database.clone().or_else(|| profile.default_database.clone()).unwrap_or_else(|| "postgres".into());
+    async fn preview_table(
+        &self,
+        handle: &mut ConnectionHandle,
+        table: &TableRef,
+        limit: u32,
+    ) -> AppResult<QueryResult> {
         let schema = table.schema.clone().unwrap_or_else(|| "public".into());
-        let sql = format!("SELECT * FROM {}.{} LIMIT {}", quote_pg(&schema), quote_pg(&table.table), limit);
-        let (client, conn) = open_client(profile, password, Some(db)).await?;
-        let result = simple_query(&client, &sql).await;
-        conn.abort();
-        result
+        let sql = format!(
+            "SELECT * FROM {}.{} LIMIT {}",
+            quote_pg(&schema),
+            quote_pg(&table.table),
+            limit
+        );
+        let client = pg_client(handle)?;
+        simple_query(client, &sql).await
     }
 
-    async fn execute_sql(&self, handle: &mut ConnectionHandle, _profile: &ConnectionProfile, _password: &str, execution: QueryExecution) -> AppResult<QueryResult> {
+    async fn execute_sql(
+        &self,
+        handle: &mut ConnectionHandle,
+        execution: QueryExecution,
+    ) -> AppResult<QueryResult> {
         match handle {
-            ConnectionHandle::Postgres { client, .. } => simple_query(client, execution.sql.trim()).await,
+            ConnectionHandle::Postgres { client, .. } => {
+                simple_query(client, execution.sql.trim()).await
+            }
             _ => Err(AppError::Validation("expected postgres handle".into())),
         }
     }
 
-    async fn apply_table_changes(&self, _profile: &ConnectionProfile, _password: &str, _changes: TableChangeSet) -> AppResult<QueryResult> {
-        Err(AppError::Unsupported(tr!("PostgreSQL 表格编辑将在后续迭代中补全").to_string()))
+    async fn apply_table_changes(
+        &self,
+        _handle: &mut ConnectionHandle,
+        _changes: TableChangeSet,
+    ) -> AppResult<QueryResult> {
+        Err(AppError::Unsupported(
+            tr!("PostgreSQL 表格编辑将在后续迭代中补全").to_string(),
+        ))
     }
 
-    async fn create_database(&self, profile: &ConnectionProfile, password: &str, name: &str, charset: Option<&str>, collation: Option<&str>) -> AppResult<()> {
-        let (client, conn) = open_client(profile, password, None).await?;
+    async fn create_database(
+        &self,
+        handle: &mut ConnectionHandle,
+        name: &str,
+        charset: Option<&str>,
+        collation: Option<&str>,
+    ) -> AppResult<()> {
+        let client = pg_client(handle)?;
         let mut sql = format!("CREATE DATABASE {}", quote_pg(name));
         if let Some(cs) = charset {
             if !cs.is_empty() {
@@ -199,81 +292,152 @@ impl DatabaseDriver for PostgresDriver {
             }
         }
         client.simple_query(&sql).await.map_err(map_pg_error)?;
-        conn.abort();
         Ok(())
     }
 
-    async fn rename_database(&self, profile: &ConnectionProfile, password: &str, old_name: &str, new_name: &str) -> AppResult<()> {
-        let (client, conn) = open_client(profile, password, None).await?;
-        client.simple_query(&format!("ALTER DATABASE {} RENAME TO {}", quote_pg(old_name), quote_pg(new_name))).await.map_err(map_pg_error)?;
-        conn.abort();
+    async fn rename_database(
+        &self,
+        handle: &mut ConnectionHandle,
+        old_name: &str,
+        new_name: &str,
+    ) -> AppResult<()> {
+        let client = pg_client(handle)?;
+        client
+            .simple_query(&format!(
+                "ALTER DATABASE {} RENAME TO {}",
+                quote_pg(old_name),
+                quote_pg(new_name)
+            ))
+            .await
+            .map_err(map_pg_error)?;
         Ok(())
     }
 
-    async fn drop_database(&self, profile: &ConnectionProfile, password: &str, name: &str) -> AppResult<()> {
-        let (client, conn) = open_client(profile, password, None).await?;
-        // Terminate existing connections first
-        client.simple_query(&format!(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{}' AND pid != pg_backend_pid()",
-            name.replace('\'', "''")
-        )).await.map_err(map_pg_error)?;
-        client.simple_query(&format!("DROP DATABASE IF EXISTS {}", quote_pg(name))).await.map_err(map_pg_error)?;
-        conn.abort();
+    async fn drop_database(
+        &self,
+        handle: &mut ConnectionHandle,
+        name: &str,
+    ) -> AppResult<()> {
+        let client = pg_client(handle)?;
+        client
+            .simple_query(&format!(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{}' AND pid != pg_backend_pid()",
+                name.replace('\'', "''")
+            ))
+            .await
+            .map_err(map_pg_error)?;
+        client
+            .simple_query(&format!("DROP DATABASE IF EXISTS {}", quote_pg(name)))
+            .await
+            .map_err(map_pg_error)?;
         Ok(())
     }
 
-    async fn create_schema(&self, profile: &ConnectionProfile, password: &str, database: &str, name: &str) -> AppResult<()> {
-        let (client, conn) = open_client(profile, password, Some(database.to_string())).await?;
-        client.simple_query(&format!("CREATE SCHEMA IF NOT EXISTS {}", quote_pg(name))).await.map_err(map_pg_error)?;
-        conn.abort();
+    async fn create_schema(
+        &self,
+        handle: &mut ConnectionHandle,
+        database: &str,
+        name: &str,
+    ) -> AppResult<()> {
+        let client = pg_client(handle)?;
+        client
+            .simple_query(&format!(
+                "CREATE SCHEMA IF NOT EXISTS {}",
+                quote_pg(name)
+            ))
+            .await
+            .map_err(map_pg_error)?;
+        let _ = database;
         Ok(())
     }
 
-    async fn rename_schema(&self, profile: &ConnectionProfile, password: &str, database: &str, old_name: &str, new_name: &str) -> AppResult<()> {
-        let (client, conn) = open_client(profile, password, Some(database.to_string())).await?;
-        client.simple_query(&format!("ALTER SCHEMA {} RENAME TO {}", quote_pg(old_name), quote_pg(new_name))).await.map_err(map_pg_error)?;
-        conn.abort();
+    async fn rename_schema(
+        &self,
+        handle: &mut ConnectionHandle,
+        database: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> AppResult<()> {
+        let client = pg_client(handle)?;
+        client
+            .simple_query(&format!(
+                "ALTER SCHEMA {} RENAME TO {}",
+                quote_pg(old_name),
+                quote_pg(new_name)
+            ))
+            .await
+            .map_err(map_pg_error)?;
+        let _ = database;
         Ok(())
     }
 
-    async fn drop_schema(&self, profile: &ConnectionProfile, password: &str, database: &str, name: &str) -> AppResult<()> {
-        let (client, conn) = open_client(profile, password, Some(database.to_string())).await?;
-        client.simple_query(&format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_pg(name))).await.map_err(map_pg_error)?;
-        conn.abort();
+    async fn drop_schema(
+        &self,
+        handle: &mut ConnectionHandle,
+        database: &str,
+        name: &str,
+    ) -> AppResult<()> {
+        let client = pg_client(handle)?;
+        client
+            .simple_query(&format!(
+                "DROP SCHEMA IF EXISTS {} CASCADE",
+                quote_pg(name)
+            ))
+            .await
+            .map_err(map_pg_error)?;
+        let _ = database;
         Ok(())
     }
 
-    async fn rename_table(&self, profile: &ConnectionProfile, password: &str, database: &str, schema: Option<&str>, old_name: &str, new_name: &str) -> AppResult<()> {
-        let (client, conn) = open_client(profile, password, Some(database.to_string())).await?;
+    async fn rename_table(
+        &self,
+        handle: &mut ConnectionHandle,
+        database: &str,
+        schema: Option<&str>,
+        old_name: &str,
+        new_name: &str,
+    ) -> AppResult<()> {
+        let client = pg_client(handle)?;
         let qualified = match schema {
-            Some(s) => format!("ALTER TABLE {}.{} RENAME TO {}", quote_pg(s), quote_pg(old_name), quote_pg(new_name)),
-            None => format!("ALTER TABLE {} RENAME TO {}", quote_pg(old_name), quote_pg(new_name)),
+            Some(s) => format!(
+                "ALTER TABLE {}.{} RENAME TO {}",
+                quote_pg(s),
+                quote_pg(old_name),
+                quote_pg(new_name)
+            ),
+            None => format!(
+                "ALTER TABLE {} RENAME TO {}",
+                quote_pg(old_name),
+                quote_pg(new_name)
+            ),
         };
+        let _ = database;
         client.simple_query(&qualified).await.map_err(map_pg_error)?;
-        conn.abort();
         Ok(())
     }
 
-    async fn dump_table_all_data(&self, profile: &ConnectionProfile, password: &str, table: &core_domain::TableRef) -> AppResult<QueryResult> {
-        let db = table.database.clone().or_else(|| profile.default_database.clone()).unwrap_or_else(|| "postgres".into());
+    async fn dump_table_all_data(
+        &self,
+        handle: &mut ConnectionHandle,
+        table: &core_domain::TableRef,
+    ) -> AppResult<QueryResult> {
         let schema = table.schema.clone().unwrap_or_else(|| "public".into());
-        let sql = format!("SELECT * FROM {}.{}", quote_pg(&schema), quote_pg(&table.table));
-        let (client, conn) = open_client(profile, password, Some(db)).await?;
-        let result = simple_query(&client, &sql).await;
-        conn.abort();
-        result
+        let sql = format!(
+            "SELECT * FROM {}.{}",
+            quote_pg(&schema),
+            quote_pg(&table.table)
+        );
+        let client = pg_client(handle)?;
+        simple_query(client, &sql).await
     }
 }
 
 // ── helpers ──
 
-fn open_client(profile: &ConnectionProfile, password: &str, database: Option<String>) -> impl std::future::Future<Output = AppResult<(Client, tokio::task::JoinHandle<()>)>> {
-    let db = database.or_else(|| profile.default_database.clone()).unwrap_or_else(|| "postgres".into());
-    let conn_str = format!("host={} port={} user={} password={} dbname={}", profile.host, profile.port, profile.username, password, db);
-    async move {
-        let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await.map_err(map_pg_error)?;
-        let handle = tokio::spawn(async move { let _ = connection.await; });
-        Ok((client, handle))
+fn pg_client(handle: &ConnectionHandle) -> AppResult<&Client> {
+    match handle {
+        ConnectionHandle::Postgres { client, .. } => Ok(client),
+        _ => Err(AppError::Validation("expected postgres handle".into())),
     }
 }
 
@@ -296,17 +460,25 @@ async fn simple_query(client: &Client, sql: &str) -> AppResult<QueryResult> {
                 }
                 rows.push(mapped);
             }
-            SimpleQueryMessage::CommandComplete(n) => { affected_rows = Some(n); message = Some(tr!("语句执行成功").to_string()); }
+            SimpleQueryMessage::CommandComplete(n) => {
+                affected_rows = Some(n);
+                message = Some(tr!("语句执行成功").to_string());
+            }
             _ => {}
         }
     }
-    // 查询返回 0 行时，从 prepare 获取列信息
     if columns.is_empty() && rows.is_empty() {
         if let Ok(stmt) = client.prepare(sql).await {
             columns = stmt.columns().iter().map(|c| c.name().to_string()).collect();
         }
     }
-    Ok(QueryResult { columns, rows, affected_rows, elapsed_ms: start.elapsed().as_millis(), message })
+    Ok(QueryResult {
+        columns,
+        rows,
+        affected_rows,
+        elapsed_ms: start.elapsed().as_millis(),
+        message,
+    })
 }
 
 fn pg_cell(value: Option<&str>) -> QueryCellValue {
@@ -316,7 +488,9 @@ fn pg_cell(value: Option<&str>) -> QueryCellValue {
     }
 }
 
-fn quote_pg(s: &str) -> String { format!("\"{}\"", s.replace('"', "\"\"")) }
+fn quote_pg(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
 
 fn map_pg_error(e: tokio_postgres::Error) -> AppError {
     if e.as_db_error().is_some() {

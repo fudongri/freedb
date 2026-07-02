@@ -1,6 +1,7 @@
 /// SessionManager —— 管理数据库会话，内置连接池、自动重试、后台 keepalive。
 ///
 /// 每次数据库操作都通过 acquire → 复用缓存连接 → ping 健康检查 流程。
+/// 所有 DatabaseDriver 方法都通过池化 handle 执行，不再自行建连。
 /// 遇到 transient 错误（连接断开、超时等）自动 exponential backoff 重试（最多 3 次）。
 /// 后台每 60s 对所有缓存连接做 ping，清理死连接。
 use connection_pool::ConnectionPool;
@@ -15,6 +16,59 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
+
+/// 内联重试+连接池复用循环。
+///
+/// $call 是一个表达式，其中 `$h` 绑定到 `&mut ConnectionHandle`，`$d` 绑定到 `&dyn DatabaseDriver`。
+macro_rules! with_pool {
+    ($self:expr, $profile:expr, $password:expr, $db:expr, $h:ident, $d:ident => $call:expr) => {{
+        let mut last_err: Option<AppError> = None;
+        #[allow(unused_assignments)]
+        let mut result = Err(AppError::Connection("retry exhausted".into()));
+        for attempt in 0..=$self.retry.max_retries {
+            if attempt > 0 {
+                sleep(Duration::from_millis($self.backoff_ms(attempt))).await;
+                $self.set_reconnecting(&$profile.id, last_err.as_ref());
+            }
+            let handle = match $self.pool.acquire($profile, $password, $db).await {
+                Ok(h) => h,
+                Err(e) => { last_err = Some(e); continue; }
+            };
+            let mut guard = handle.lock().await;
+            let $h: &mut driver_api::ConnectionHandle = &mut *guard;
+            let $d: &dyn DatabaseDriver = if matches!($profile.kind, DatabaseKind::Postgres) {
+                &$self.pool.postgres
+            } else {
+                &$self.pool.mysql
+            };
+            match $call.await {
+                Ok(val) => {
+                    drop(guard);
+                    $self.set_connected(&$profile.id);
+                    result = Ok(val);
+                    break;
+                }
+                Err(e) if $self.is_retryable(&e) => {
+                    drop(guard);
+                    $self.pool.evict(&$profile.id);
+                    last_err = Some(e);
+                }
+                Err(e) => {
+                    drop(guard);
+                    $self.set_failed(&$profile.id, &e);
+                    result = Err(e);
+                    break;
+                }
+            }
+        }
+        if result.is_err() {
+            let err = last_err.unwrap_or_else(|| AppError::Connection("retry exhausted".into()));
+            $self.set_failed(&$profile.id, &err);
+        }
+        result
+    }};
+}
+
 
 #[derive(Debug, Clone)]
 pub struct SessionStatus {
@@ -49,7 +103,6 @@ impl SessionManager {
         }
     }
 
-    /// 启动 keepalive —— 在 tokio runtime 启动后调用
     pub fn start_keepalive(&self) {
         self.pool.start_keepalive();
     }
@@ -95,37 +148,8 @@ impl SessionManager {
         profile: &ConnectionProfile,
         password: &str,
     ) -> AppResult<Vec<ExplorerNode>> {
-        let mut last_err = None;
-        for attempt in 0..=self.retry.max_retries {
-            if attempt > 0 {
-                sleep(Duration::from_millis(self.backoff_ms(attempt))).await;
-                self.set_reconnecting(&profile.id, last_err.as_ref());
-            }
-            let handle = match self.pool.acquire(profile, password, None).await {
-                Ok(h) => h,
-                Err(e) => { last_err = Some(e); continue; }
-            };
-            let result = {
-                let guard = handle.lock().await;
-                let d: &dyn DatabaseDriver = if guard.is_postgres() {
-                    &self.pool.postgres
-                } else {
-                    &self.pool.mysql
-                };
-                d.list_roots(profile, password).await
-            };
-            match result {
-                Ok(nodes) => { self.set_connected(&profile.id); return Ok(nodes); }
-                Err(e) if self.is_retryable(&e) => {
-                    self.pool.evict(&profile.id);
-                    last_err = Some(e);
-                }
-                Err(e) => { self.set_failed(&profile.id, &e); return Err(e); }
-            }
-        }
-        let err = last_err.unwrap_or_else(|| AppError::Connection("retry exhausted".into()));
-        self.set_failed(&profile.id, &err);
-        Err(err)
+        let db = profile.default_database.as_deref();
+        with_pool!(self, profile, password, db, h, d => d.list_roots(h, &profile.id))
     }
 
     pub async fn load_node_children(
@@ -134,37 +158,8 @@ impl SessionManager {
         password: &str,
         node: &ExplorerNode,
     ) -> AppResult<Vec<ExplorerNode>> {
-        let mut last_err = None;
-        for attempt in 0..=self.retry.max_retries {
-            if attempt > 0 {
-                sleep(Duration::from_millis(self.backoff_ms(attempt))).await;
-                self.set_reconnecting(&profile.id, last_err.as_ref());
-            }
-            let handle = match self.pool.acquire(profile, password, None).await {
-                Ok(h) => h,
-                Err(e) => { last_err = Some(e); continue; }
-            };
-            let result = {
-                let guard = handle.lock().await;
-                let d: &dyn DatabaseDriver = if guard.is_postgres() {
-                    &self.pool.postgres
-                } else {
-                    &self.pool.mysql
-                };
-                d.list_children(profile, password, node).await
-            };
-            match result {
-                Ok(nodes) => { self.set_connected(&profile.id); return Ok(nodes); }
-                Err(e) if self.is_retryable(&e) => {
-                    self.pool.evict(&profile.id);
-                    last_err = Some(e);
-                }
-                Err(e) => { self.set_failed(&profile.id, &e); return Err(e); }
-            }
-        }
-        let err = last_err.unwrap_or_else(|| AppError::Connection("retry exhausted".into()));
-        self.set_failed(&profile.id, &err);
-        Err(err)
+        let db = node.database.as_deref().or(profile.default_database.as_deref());
+        with_pool!(self, profile, password, db, h, d => d.list_children(h, &profile.id, node))
     }
 
     pub async fn load_table_definition(
@@ -173,33 +168,8 @@ impl SessionManager {
         password: &str,
         table: &TableRef,
     ) -> AppResult<TableDefinition> {
-        let mut last_err = None;
-        let db = table.database.clone().or_else(|| profile.default_database.clone());
-        for attempt in 0..=self.retry.max_retries {
-            if attempt > 0 { sleep(Duration::from_millis(self.backoff_ms(attempt))).await; }
-            let handle = match self.pool.acquire(profile, password, db.as_deref()).await {
-                Ok(h) => h,
-                Err(e) => { last_err = Some(e); continue; }
-            };
-            let result = {
-                let guard = handle.lock().await;
-                let d: &dyn DatabaseDriver = if guard.is_postgres() {
-                    &self.pool.postgres
-                } else {
-                    &self.pool.mysql
-                };
-                d.load_table_definition(profile, password, table).await
-            };
-            match result {
-                Ok(def) => return Ok(def),
-                Err(e) if self.is_retryable(&e) => {
-                    self.pool.evict(&profile.id);
-                    last_err = Some(e);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(last_err.unwrap_or_else(|| AppError::Connection("retry exhausted".into())))
+        let db = table.database.as_deref().or(profile.default_database.as_deref());
+        with_pool!(self, profile, password, db, h, d => d.load_table_definition(h, table))
     }
 
     pub async fn preview_table(
@@ -209,33 +179,8 @@ impl SessionManager {
         table: &TableRef,
         limit: u32,
     ) -> AppResult<QueryResult> {
-        let mut last_err = None;
-        let db = table.database.clone().or_else(|| profile.default_database.clone());
-        for attempt in 0..=self.retry.max_retries {
-            if attempt > 0 { sleep(Duration::from_millis(self.backoff_ms(attempt))).await; }
-            let handle = match self.pool.acquire(profile, password, db.as_deref()).await {
-                Ok(h) => h,
-                Err(e) => { last_err = Some(e); continue; }
-            };
-            let result = {
-                let guard = handle.lock().await;
-                let d: &dyn DatabaseDriver = if guard.is_postgres() {
-                    &self.pool.postgres
-                } else {
-                    &self.pool.mysql
-                };
-                d.preview_table(profile, password, table, limit).await
-            };
-            match result {
-                Ok(r) => return Ok(r),
-                Err(e) if self.is_retryable(&e) => {
-                    self.pool.evict(&profile.id);
-                    last_err = Some(e);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(last_err.unwrap_or_else(|| AppError::Connection("retry exhausted".into())))
+        let db = table.database.as_deref().or(profile.default_database.as_deref());
+        with_pool!(self, profile, password, db, h, d => d.preview_table(h, table, limit))
     }
 
     pub async fn execute_sql(
@@ -244,38 +189,10 @@ impl SessionManager {
         password: &str,
         execution: QueryExecution,
     ) -> AppResult<QueryResult> {
-        let mut last_err = None;
-        let db = execution.database.clone().or_else(|| profile.default_database.clone());
-        for attempt in 0..=self.retry.max_retries {
-            if attempt > 0 {
-                sleep(Duration::from_millis(self.backoff_ms(attempt))).await;
-                self.set_reconnecting(&profile.id, last_err.as_ref());
-            }
-            let handle = match self.pool.acquire(profile, password, db.as_deref()).await {
-                Ok(h) => h,
-                Err(e) => { last_err = Some(e); continue; }
-            };
-            let result = {
-                let mut guard = handle.lock().await;
-                let d: &dyn DatabaseDriver = if guard.is_postgres() {
-                    &self.pool.postgres
-                } else {
-                    &self.pool.mysql
-                };
-                d.execute_sql(&mut guard, profile, password, execution.clone()).await
-            };
-            match result {
-                Ok(r) => { self.set_connected(&profile.id); return Ok(r); }
-                Err(e) if self.is_retryable(&e) => {
-                    self.pool.evict(&profile.id);
-                    last_err = Some(e);
-                }
-                Err(e) => { return Err(e); }
-            }
-        }
-        let err = last_err.unwrap_or_else(|| AppError::Connection("retry exhausted".into()));
-        self.set_failed(&profile.id, &err);
-        Err(err)
+        let db_owned = execution.database.clone().or_else(|| profile.default_database.clone());
+        let db: Option<&str> = db_owned.as_deref();
+        let exec = execution;
+        with_pool!(self, profile, password, db, h, d => d.execute_sql(h, exec.clone()))
     }
 
     pub async fn apply_table_changes(
@@ -284,63 +201,8 @@ impl SessionManager {
         password: &str,
         changes: TableChangeSet,
     ) -> AppResult<QueryResult> {
-        let mut last_err = None;
-        let db = changes.table.database.clone().or_else(|| profile.default_database.clone());
-        for attempt in 0..=self.retry.max_retries {
-            if attempt > 0 { sleep(Duration::from_millis(self.backoff_ms(attempt))).await; }
-            let handle = match self.pool.acquire(profile, password, db.as_deref()).await {
-                Ok(h) => h,
-                Err(e) => { last_err = Some(e); continue; }
-            };
-            let result = {
-                let guard = handle.lock().await;
-                let d: &dyn DatabaseDriver = if guard.is_postgres() {
-                    &self.pool.postgres
-                } else {
-                    &self.pool.mysql
-                };
-                d.apply_table_changes(profile, password, changes.clone()).await
-            };
-            match result {
-                Ok(r) => return Ok(r),
-                Err(e) if self.is_retryable(&e) => {
-                    self.pool.evict(&profile.id);
-                    last_err = Some(e);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(last_err.unwrap_or_else(|| AppError::Connection("retry exhausted".into())))
-    }
-
-    // ── DDL 操作 ──
-
-    pub async fn create_database(&self, profile: &ConnectionProfile, password: &str, name: &str, charset: Option<&str>, collation: Option<&str>) -> AppResult<()> {
-        self.driver(profile.kind).create_database(profile, password, name, charset, collation).await
-    }
-
-    pub async fn rename_database(&self, profile: &ConnectionProfile, password: &str, old_name: &str, new_name: &str) -> AppResult<()> {
-        self.driver(profile.kind).rename_database(profile, password, old_name, new_name).await
-    }
-
-    pub async fn drop_database(&self, profile: &ConnectionProfile, password: &str, name: &str) -> AppResult<()> {
-        self.driver(profile.kind).drop_database(profile, password, name).await
-    }
-
-    pub async fn create_schema(&self, profile: &ConnectionProfile, password: &str, database: &str, name: &str) -> AppResult<()> {
-        self.driver(profile.kind).create_schema(profile, password, database, name).await
-    }
-
-    pub async fn rename_schema(&self, profile: &ConnectionProfile, password: &str, database: &str, old_name: &str, new_name: &str) -> AppResult<()> {
-        self.driver(profile.kind).rename_schema(profile, password, database, old_name, new_name).await
-    }
-
-    pub async fn drop_schema(&self, profile: &ConnectionProfile, password: &str, database: &str, name: &str) -> AppResult<()> {
-        self.driver(profile.kind).drop_schema(profile, password, database, name).await
-    }
-
-    pub async fn rename_table(&self, profile: &ConnectionProfile, password: &str, database: &str, schema: Option<&str>, old_name: &str, new_name: &str) -> AppResult<()> {
-        self.driver(profile.kind).rename_table(profile, password, database, schema, old_name, new_name).await
+        let db = changes.table.database.as_deref().or(profile.default_database.as_deref());
+        with_pool!(self, profile, password, db, h, d => d.apply_table_changes(h, changes.clone()))
     }
 
     pub async fn dump_table_all_data(
@@ -349,63 +211,124 @@ impl SessionManager {
         password: &str,
         table: &TableRef,
     ) -> AppResult<QueryResult> {
-        let mut last_err = None;
-        let db = table.database.clone().or_else(|| profile.default_database.clone());
-        for attempt in 0..=self.retry.max_retries {
-            if attempt > 0 { sleep(Duration::from_millis(self.backoff_ms(attempt))).await; }
-            let handle = match self.pool.acquire(profile, password, db.as_deref()).await {
-                Ok(h) => h,
-                Err(e) => { last_err = Some(e); continue; }
-            };
-            let result = {
-                let guard = handle.lock().await;
-                let d: &dyn DatabaseDriver = if guard.is_postgres() {
-                    &self.pool.postgres
-                } else {
-                    &self.pool.mysql
-                };
-                d.dump_table_all_data(profile, password, table).await
-            };
-            match result {
-                Ok(r) => return Ok(r),
-                Err(e) if self.is_retryable(&e) => {
-                    self.pool.evict(&profile.id);
-                    last_err = Some(e);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(last_err.unwrap_or_else(|| AppError::Connection("retry exhausted".into())))
+        let db = table.database.as_deref().or(profile.default_database.as_deref());
+        with_pool!(self, profile, password, db, h, d => d.dump_table_all_data(h, table))
     }
+
+    // ── DDL 操作 ──
+
+    pub async fn create_database(
+        &self,
+        profile: &ConnectionProfile,
+        password: &str,
+        name: &str,
+        charset: Option<&str>,
+        collation: Option<&str>,
+    ) -> AppResult<()> {
+        let db = profile.default_database.as_deref();
+        with_pool!(self, profile, password, db, h, d => d.create_database(h, name, charset, collation))
+    }
+
+    pub async fn rename_database(
+        &self,
+        profile: &ConnectionProfile,
+        password: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> AppResult<()> {
+        let db = profile.default_database.as_deref();
+        with_pool!(self, profile, password, db, h, d => d.rename_database(h, old_name, new_name))
+    }
+
+    pub async fn drop_database(
+        &self,
+        profile: &ConnectionProfile,
+        password: &str,
+        name: &str,
+    ) -> AppResult<()> {
+        let db = profile.default_database.as_deref();
+        with_pool!(self, profile, password, db, h, d => d.drop_database(h, name))
+    }
+
+    pub async fn create_schema(
+        &self,
+        profile: &ConnectionProfile,
+        password: &str,
+        database: &str,
+        name: &str,
+    ) -> AppResult<()> {
+        with_pool!(self, profile, password, Some(database), h, d => d.create_schema(h, database, name))
+    }
+
+    pub async fn rename_schema(
+        &self,
+        profile: &ConnectionProfile,
+        password: &str,
+        database: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> AppResult<()> {
+        with_pool!(self, profile, password, Some(database), h, d => d.rename_schema(h, database, old_name, new_name))
+    }
+
+    pub async fn drop_schema(
+        &self,
+        profile: &ConnectionProfile,
+        password: &str,
+        database: &str,
+        name: &str,
+    ) -> AppResult<()> {
+        with_pool!(self, profile, password, Some(database), h, d => d.drop_schema(h, database, name))
+    }
+
+    pub async fn rename_table(
+        &self,
+        profile: &ConnectionProfile,
+        password: &str,
+        database: &str,
+        schema: Option<&str>,
+        old_name: &str,
+        new_name: &str,
+    ) -> AppResult<()> {
+        with_pool!(self, profile, password, Some(database), h, d => d.rename_table(h, database, schema, old_name, new_name))
+    }
+
+    // ── 连接生命周期 ──
 
     pub fn disconnect_connection(&self, connection_id: &str) {
         self.pool.evict(connection_id);
-        // 标记为用户主动断开，阻止残留异步任务把状态篡改回 Connected
-        self.disconnected_by_user.write().insert(connection_id.to_string());
+        self.disconnected_by_user
+            .write()
+            .insert(connection_id.to_string());
         self.statuses.write().insert(
             connection_id.to_string(),
-            SessionStatus { state: ConnectionState::Disconnected, last_error: None },
+            SessionStatus {
+                state: ConnectionState::Disconnected,
+                last_error: None,
+            },
         );
     }
 
     pub fn disconnect_all(&self) {
         self.pool.disconnect_all();
-        // 标记所有为用户主动断开
         let ids: Vec<String> = self.statuses.read().keys().cloned().collect();
         self.disconnected_by_user.write().extend(ids);
         self.statuses.write().clear();
     }
 
-    /// 清除"用户主动断开"标记，在用户显式发起新连接前调用，
-    /// 允许后续 set_connected() 正常生效。
     pub fn clear_user_disconnect(&self, connection_id: &str) {
         self.disconnected_by_user.write().remove(connection_id);
     }
 
     pub fn connection_status(&self, connection_id: &str) -> SessionStatus {
-        self.statuses.read().get(connection_id).cloned().unwrap_or(SessionStatus {
-            state: ConnectionState::Disconnected, last_error: None,
-        })
+        self.statuses
+            .read()
+            .get(connection_id)
+            .cloned()
+            .unwrap_or(SessionStatus {
+                state: ConnectionState::Disconnected,
+                last_error: None,
+            })
     }
 
     fn store_status<T>(&self, id: String, result: &AppResult<T>) {
@@ -413,36 +336,51 @@ impl SessionManager {
     }
 
     fn set_connected(&self, id: &str) {
-        // 不覆盖用户主动断开的状态：若该连接已被用户手动关闭，
-        // 此时若有残留异步任务完成，不应把状态篡改回 Connected。
         if self.disconnected_by_user.read().contains(id) {
             return;
         }
-        self.statuses.write().insert(id.to_string(), SessionStatus {
-            state: ConnectionState::Connected, last_error: None,
-        });
+        self.statuses.write().insert(
+            id.to_string(),
+            SessionStatus {
+                state: ConnectionState::Connected,
+                last_error: None,
+            },
+        );
     }
 
     fn set_failed(&self, id: &str, error: &AppError) {
-        self.statuses.write().insert(id.to_string(), SessionStatus {
-            state: ConnectionState::Failed, last_error: Some(error.to_string()),
-        });
+        self.statuses.write().insert(
+            id.to_string(),
+            SessionStatus {
+                state: ConnectionState::Failed,
+                last_error: Some(error.to_string()),
+            },
+        );
     }
 
     fn set_reconnecting(&self, id: &str, error: Option<&AppError>) {
-        // 同 set_connected：不覆盖用户主动断开的状态
         if self.disconnected_by_user.read().contains(id) {
             return;
         }
-        self.statuses.write().insert(id.to_string(), SessionStatus {
-            state: ConnectionState::Reconnecting, last_error: error.map(|e| e.to_string()),
-        });
+        self.statuses.write().insert(
+            id.to_string(),
+            SessionStatus {
+                state: ConnectionState::Reconnecting,
+                last_error: error.map(|e| e.to_string()),
+            },
+        );
     }
 }
 
 fn session_from_result<T>(result: &AppResult<T>) -> SessionStatus {
     match result {
-        Ok(_) => SessionStatus { state: ConnectionState::Connected, last_error: None },
-        Err(e) => SessionStatus { state: ConnectionState::Failed, last_error: Some(e.to_string()) },
+        Ok(_) => SessionStatus {
+            state: ConnectionState::Connected,
+            last_error: None,
+        },
+        Err(e) => SessionStatus {
+            state: ConnectionState::Failed,
+            last_error: Some(e.to_string()),
+        },
     }
 }
