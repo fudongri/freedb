@@ -760,8 +760,8 @@ impl DesktopApp {
             .ok()
             .flatten()
             .and_then(|value| value.parse::<f32>().ok())
-            .unwrap_or(100.0)
-            .clamp(1.0, 500.0);
+            .unwrap_or(200.0)
+            .clamp(1.0, 2000.0);
         let mut app = Self {
             runtime,
             services,
@@ -7552,14 +7552,14 @@ fn sidebar_node_qualified_name(node: &ExplorerNode) -> String {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().slider_width = 130.0;
                             ui.label(tr!("慢"));
-                            ui.add(egui::Slider::new(&mut self.scroll_speed, 1.0..=500.0).step_by(1.0));
+                            ui.add(egui::Slider::new(&mut self.scroll_speed, 1.0..=2000.0).step_by(1.0));
                             ui.label(tr!("快"));
                         });
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(format!("{} 行/秒", self.scroll_speed.round() as u32)).size(11.0));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.small_button(tr!("默认")).clicked() {
-                                    self.scroll_speed = 100.0;
+                                    self.scroll_speed = 200.0;
                                 }
                             });
                         });
@@ -7689,7 +7689,7 @@ impl eframe::App for DesktopApp {
         ctx.set_zoom_factor(self.zoom_factor);
         // macOS 触控板发送 Point 事件，line_scroll_speed 对其无效；
         // 通过缩放 smooth_scroll_delta 统一调节所有滚动区域速度。
-        let scale = self.scroll_speed / 100.0;
+        let scale = self.scroll_speed / 200.0;
         if (scale - 1.0).abs() > f32::EPSILON {
             ctx.input_mut(|input| {
                 input.smooth_scroll_delta *= scale;
