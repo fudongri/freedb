@@ -103,6 +103,10 @@ fn en(key: &'static str) -> &'static str {
         "快捷键速查表" => "Shortcuts",
         "运行日志" => "Logs",
         "切换语言" => "Language",
+        "侧栏滚动速度" => "Sidebar Scroll Speed",
+        "慢" => "Slow",
+        "快" => "Fast",
+        "默认" => "Default",
 
         // ── app.rs toolbar / menus ──
         "新建连接" => "New Connection",

@@ -88,6 +88,8 @@ pub struct DesktopApp {
     dismissed_update: bool,
     is_shortcuts_open: bool,
     is_log_window_open: bool,
+    is_scroll_speed_open: bool,
+    scroll_speed: f32,
     log_buffer: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     menu_event_rx: Option<Receiver<muda::MenuEvent>>,
     native_menu: Option<muda::Menu>,
@@ -97,6 +99,7 @@ pub struct DesktopApp {
     menu_shortcuts: Option<muda::MenuItem>,
     menu_log: Option<muda::MenuItem>,
     menu_lang: Option<muda::MenuItem>,
+    menu_scroll_speed: Option<muda::MenuItem>,
     locale: Locale,
 }
 
@@ -714,6 +717,7 @@ impl DesktopApp {
         menu_shortcuts: Option<muda::MenuItem>,
         menu_log: Option<muda::MenuItem>,
         menu_lang: Option<muda::MenuItem>,
+        menu_scroll_speed: Option<muda::MenuItem>,
         locale: Locale,
     ) -> Self {
         // 加载已保存的语言，优先于系统检测
@@ -749,6 +753,13 @@ impl DesktopApp {
             .and_then(|value| value.parse::<f32>().ok())
             .unwrap_or(1.0)
             .clamp(0.5, 3.0);
+        let scroll_speed = services
+            .load_ui_state("scroll_speed")
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(40.0)
+            .clamp(1.0, 200.0);
         let mut app = Self {
             runtime,
             services,
@@ -809,6 +820,8 @@ impl DesktopApp {
             dismissed_update: false,
             is_shortcuts_open: false,
             is_log_window_open: false,
+            is_scroll_speed_open: false,
+            scroll_speed,
             log_buffer,
             menu_event_rx,
             native_menu,
@@ -817,6 +830,7 @@ impl DesktopApp {
             menu_shortcuts,
             menu_log,
             menu_lang,
+            menu_scroll_speed,
             locale,
         };
 
@@ -1008,6 +1022,8 @@ impl DesktopApp {
                 self.is_shortcuts_open = true;
             } else if event.id == "运行日志" {
                 self.is_log_window_open = true;
+            } else if event.id == "侧栏滚动速度" {
+                self.is_scroll_speed_open = true;
             } else if event.id == "切换语言" {
                 let new_locale = match get_locale() {
                     Locale::ZhCn => Locale::En,
@@ -1024,6 +1040,7 @@ impl DesktopApp {
                     let lang_label = if new_locale == Locale::En { "中文" } else { "English" };
                     m.set_text(lang_label);
                 }
+                if let Some(m) = &self.menu_scroll_speed { m.set_text(tr!("侧栏滚动速度")); }
                 self.status_message = tr!("已切换为 {}", new_locale.display_name());
                 self.status_level = StatusLevel::Success;
             }
@@ -7511,6 +7528,45 @@ fn sidebar_node_qualified_name(node: &ExplorerNode) -> String {
             });
         self.is_log_window_open = open;
     }
+
+    fn render_scroll_speed_dialog(&mut self, ctx: &egui::Context) {
+        if !self.is_scroll_speed_open {
+            return;
+        }
+        let mut open = self.is_scroll_speed_open;
+        let screen = ctx.input(|i| i.screen_rect());
+        let pos = screen.center();
+        egui::Area::new(egui::Id::new("scroll_speed_dialog"))
+            .fixed_pos(pos)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .interactable(true)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .show(ui, |ui| {
+                        ui.set_width(240.0);
+                        ui.label(RichText::new(tr!("侧栏滚动速度")).strong());
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().slider_width = 130.0;
+                            ui.label(tr!("慢"));
+                            ui.add(egui::Slider::new(&mut self.scroll_speed, 1.0..=200.0).step_by(1.0));
+                            ui.label(tr!("快"));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("{} 行/秒", self.scroll_speed.round() as u32)).size(11.0));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button(tr!("默认")).clicked() {
+                                    self.scroll_speed = 40.0;
+                                }
+                            });
+                        });
+                        if ui.button(tr!("关闭")).clicked() {
+                            open = false;
+                        }
+                    });
+            });
+        self.is_scroll_speed_open = open;
+    }
 }
 
 async fn check_for_update() -> Option<UpdateInfo> {
@@ -7579,6 +7635,15 @@ impl eframe::App for DesktopApp {
         let style = app_style(ctx.style().as_ref());
         ctx.set_style(style);
         ctx.set_zoom_factor(self.zoom_factor);
+        // macOS 触控板发送 Point 事件，line_scroll_speed 对其无效；
+        // 通过缩放 smooth_scroll_delta 统一调节所有滚动区域速度。
+        let scale = self.scroll_speed / 40.0;
+        if (scale - 1.0).abs() > f32::EPSILON {
+            ctx.input_mut(|input| {
+                input.smooth_scroll_delta *= scale;
+                input.raw_scroll_delta *= scale;
+            });
+        }
 
         egui::TopBottomPanel::top("toolbar")
             .exact_height(40.0)
@@ -8050,6 +8115,7 @@ impl eframe::App for DesktopApp {
         self.render_batch_save_confirm_dialog(ctx);
         self.render_shortcuts_dialog(ctx);
         self.render_log_window(ctx);
+        self.render_scroll_speed_dialog(ctx);
 
         // Cmd+D: new query tab (优先使用侧栏选中节点的上下文)
         let new_query = ctx.input_mut(|input| {
@@ -8177,6 +8243,9 @@ impl eframe::App for DesktopApp {
         let _ = self
             .services
             .save_ui_state("zoom_factor", &format!("{:.2}", self.zoom_factor));
+        let _ = self
+            .services
+            .save_ui_state("scroll_speed", &format!("{:.1}", self.scroll_speed));
     }
 }
 
