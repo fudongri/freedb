@@ -79,7 +79,7 @@ fn main() -> eframe::Result<()> {
         let mi_log = muda::MenuItem::with_id("运行日志", &tr!("运行日志"), true, None::<muda::accelerator::Accelerator>);
         let lang_label = if locale == Locale::En { "中文" } else { "English" };
         let mi_lang = muda::MenuItem::with_id("切换语言", lang_label, true, None::<muda::accelerator::Accelerator>);
-        let mi_scroll_speed = muda::MenuItem::with_id("侧栏滚动速度", &tr!("侧栏滚动速度"), true, None::<muda::accelerator::Accelerator>);
+        let mi_scroll_speed = muda::MenuItem::with_id("滚动速度", &tr!("滚动速度"), true, None::<muda::accelerator::Accelerator>);
 
         let view_menu = muda::Submenu::with_items(
             &tr!("查看"),

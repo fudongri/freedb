@@ -758,8 +758,8 @@ impl DesktopApp {
             .ok()
             .flatten()
             .and_then(|value| value.parse::<f32>().ok())
-            .unwrap_or(40.0)
-            .clamp(1.0, 200.0);
+            .unwrap_or(100.0)
+            .clamp(1.0, 500.0);
         let mut app = Self {
             runtime,
             services,
@@ -1022,7 +1022,7 @@ impl DesktopApp {
                 self.is_shortcuts_open = true;
             } else if event.id == "运行日志" {
                 self.is_log_window_open = true;
-            } else if event.id == "侧栏滚动速度" {
+            } else if event.id == "滚动速度" {
                 self.is_scroll_speed_open = true;
             } else if event.id == "切换语言" {
                 let new_locale = match get_locale() {
@@ -1040,7 +1040,7 @@ impl DesktopApp {
                     let lang_label = if new_locale == Locale::En { "中文" } else { "English" };
                     m.set_text(lang_label);
                 }
-                if let Some(m) = &self.menu_scroll_speed { m.set_text(tr!("侧栏滚动速度")); }
+                if let Some(m) = &self.menu_scroll_speed { m.set_text(tr!("滚动速度")); }
                 self.status_message = tr!("已切换为 {}", new_locale.display_name());
                 self.status_level = StatusLevel::Success;
             }
@@ -7544,19 +7544,19 @@ fn sidebar_node_qualified_name(node: &ExplorerNode) -> String {
                 egui::Frame::popup(ui.style())
                     .show(ui, |ui| {
                         ui.set_width(240.0);
-                        ui.label(RichText::new(tr!("侧栏滚动速度")).strong());
+                        ui.label(RichText::new(tr!("滚动速度")).strong());
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             ui.spacing_mut().slider_width = 130.0;
                             ui.label(tr!("慢"));
-                            ui.add(egui::Slider::new(&mut self.scroll_speed, 1.0..=200.0).step_by(1.0));
+                            ui.add(egui::Slider::new(&mut self.scroll_speed, 1.0..=500.0).step_by(1.0));
                             ui.label(tr!("快"));
                         });
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(format!("{} 行/秒", self.scroll_speed.round() as u32)).size(11.0));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.small_button(tr!("默认")).clicked() {
-                                    self.scroll_speed = 40.0;
+                                    self.scroll_speed = 100.0;
                                 }
                             });
                         });
@@ -7637,7 +7637,7 @@ impl eframe::App for DesktopApp {
         ctx.set_zoom_factor(self.zoom_factor);
         // macOS 触控板发送 Point 事件，line_scroll_speed 对其无效；
         // 通过缩放 smooth_scroll_delta 统一调节所有滚动区域速度。
-        let scale = self.scroll_speed / 40.0;
+        let scale = self.scroll_speed / 100.0;
         if (scale - 1.0).abs() > f32::EPSILON {
             ctx.input_mut(|input| {
                 input.smooth_scroll_delta *= scale;
