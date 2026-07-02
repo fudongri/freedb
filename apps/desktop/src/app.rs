@@ -101,6 +101,8 @@ pub struct DesktopApp {
     menu_lang: Option<muda::MenuItem>,
     menu_scroll_speed: Option<muda::MenuItem>,
     locale: Locale,
+    /// 帧计数器：延迟最大化到窗口完全显示后执行
+    frame_count: usize,
 }
 
 struct SchemaLoadResult {
@@ -832,6 +834,7 @@ impl DesktopApp {
             menu_lang,
             menu_scroll_speed,
             locale,
+            frame_count: 0,
         };
 
         // 启动后台更新检查
@@ -7596,6 +7599,35 @@ async fn check_for_update() -> Option<UpdateInfo> {
 
 impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // 首帧延迟最大化：Windows 上用原生 ShowWindow 直接最大化，
+        // macOS 上用 ViewportCommand。egui/winit 的 with_maximized(true)
+        // 会导致 winit 内部最大化状态与实际窗口不同步——窗口实际未最大化
+        // 但 winit 认为已最大化，导致第一次点最大化按钮变成"还原"（无变化），
+        // 第二次才真正最大化。
+        self.frame_count += 1;
+        if self.frame_count == 3 {
+            #[cfg(target_os = "windows")]
+            {
+                use raw_window_handle::HasWindowHandle;
+                if let Ok(handle) = frame.window_handle() {
+                    if let raw_window_handle::RawWindowHandle::Win32(h) = handle.as_raw() {
+                        let hwnd = h.hwnd.get() as isize;
+                        unsafe {
+                            // SW_MAXIMIZE = 3
+                            unsafe extern "system" {
+                                fn ShowWindow(hwnd: isize, nCmdShow: i32) -> i32;
+                            }
+                            ShowWindow(hwnd, 3);
+                        }
+                    }
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            }
+        }
+
         // 延迟初始化原生菜单栏：winit 启动时会创建默认菜单，
         // 必须在第一帧 update() 时才挂载我们的菜单，否则会被覆盖。
         if !self.native_menu_initialized {
