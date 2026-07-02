@@ -11,6 +11,8 @@ pub struct HistoryEntry {
     pub connection_id: String,
     pub sql_text: String,
     pub executed_at: DateTime<Utc>,
+    pub elapsed_ms: u128,
+    pub success: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -39,12 +41,12 @@ impl HistoryStore {
         Ok(store)
     }
 
-    pub fn append(&self, connection_id: &str, sql_text: &str) -> Result<()> {
+    pub fn append(&self, connection_id: &str, sql_text: &str, elapsed_ms: u128, success: bool) -> Result<()> {
         let connection = self.connection.lock();
         connection.execute(
-            "INSERT INTO query_history (id, connection_id, sql_text, executed_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![Uuid::new_v4().to_string(), connection_id, sql_text, Utc::now().to_rfc3339()],
+            "INSERT INTO query_history (id, connection_id, sql_text, executed_at, elapsed_ms, success)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![Uuid::new_v4().to_string(), connection_id, sql_text, Utc::now().to_rfc3339(), elapsed_ms as i64, success as i64],
         )?;
         Ok(())
     }
@@ -52,7 +54,7 @@ impl HistoryStore {
     pub fn list_by_connection(&self, connection_id: &str, limit: usize) -> Result<Vec<HistoryEntry>> {
         let connection = self.connection.lock();
         let mut statement = connection.prepare(
-            "SELECT id, connection_id, sql_text, executed_at
+            "SELECT id, connection_id, sql_text, executed_at, elapsed_ms, success
              FROM query_history
              WHERE connection_id = ?1
              ORDER BY executed_at DESC
@@ -66,10 +68,21 @@ impl HistoryStore {
                 executed_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(3)?)
                     .map_err(to_sql_error)?
                     .with_timezone(&Utc),
+                elapsed_ms: row.get::<_, i64>(4).unwrap_or(0) as u128,
+                success: row.get::<_, i64>(5).unwrap_or(1) != 0,
             })
         })?;
 
         rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn clear_by_connection(&self, connection_id: &str) -> Result<usize> {
+        let connection = self.connection.lock();
+        let deleted = connection.execute(
+            "DELETE FROM query_history WHERE connection_id = ?1",
+            params![connection_id],
+        )?;
+        Ok(deleted)
     }
 
     pub fn save_query(
@@ -113,9 +126,20 @@ impl HistoryStore {
         let connection = self.connection.lock();
         connection.execute(
             "UPDATE saved_queries
-             SET title = ?2, saved_at = ?3
+             SET title = ?2
              WHERE id = ?1",
-            params![id, title, Utc::now().to_rfc3339()],
+            params![id, title],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_saved_query(&self, id: &str, sql_text: &str, connection_id: &str, database: Option<&str>) -> Result<()> {
+        let connection = self.connection.lock();
+        connection.execute(
+            "UPDATE saved_queries
+             SET sql_text = ?2, connection_id = ?3, database = ?4
+             WHERE id = ?1",
+            params![id, sql_text, connection_id, database],
         )?;
         Ok(())
     }
@@ -140,6 +164,30 @@ impl HistoryStore {
              LIMIT ?2",
         )?;
         let rows = statement.query_map(params![connection_id, limit as i64], |row| {
+            Ok(SavedQueryRecord {
+                id: row.get(0)?,
+                connection_id: row.get(1)?,
+                database: row.get(2)?,
+                title: row.get(3)?,
+                sql_text: row.get(4)?,
+                saved_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(5)?)
+                    .map_err(to_sql_error)?
+                    .with_timezone(&Utc),
+            })
+        })?;
+
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_all_saved_queries(&self, limit: usize) -> Result<Vec<SavedQueryRecord>> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT id, connection_id, database, title, sql_text, saved_at
+             FROM saved_queries
+             ORDER BY saved_at DESC
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit as i64], |row| {
             Ok(SavedQueryRecord {
                 id: row.get(0)?,
                 connection_id: row.get(1)?,
@@ -186,6 +234,26 @@ impl HistoryStore {
         if !has_database_column {
             connection.execute_batch(
                 "ALTER TABLE saved_queries ADD COLUMN database TEXT;",
+            )?;
+        }
+
+        // Migrate: add elapsed_ms column to query_history if missing
+        let has_elapsed_column: bool = connection
+            .prepare("SELECT elapsed_ms FROM query_history LIMIT 0")
+            .is_ok();
+        if !has_elapsed_column {
+            connection.execute_batch(
+                "ALTER TABLE query_history ADD COLUMN elapsed_ms INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+
+        // Migrate: add success column to query_history if missing
+        let has_success_column: bool = connection
+            .prepare("SELECT success FROM query_history LIMIT 0")
+            .is_ok();
+        if !has_success_column {
+            connection.execute_batch(
+                "ALTER TABLE query_history ADD COLUMN success INTEGER NOT NULL DEFAULT 1;",
             )?;
         }
 

@@ -61,6 +61,7 @@ pub trait DatabaseDriver: Send + Sync {
     ) -> AppResult<core_domain::QueryResult>;
     async fn execute_sql(
         &self,
+        handle: &mut ConnectionHandle,
         profile: &ConnectionProfile,
         password: &str,
         execution: core_domain::QueryExecution,
@@ -71,4 +72,16 @@ pub trait DatabaseDriver: Send + Sync {
         password: &str,
         changes: core_domain::TableChangeSet,
     ) -> AppResult<core_domain::QueryResult>;
+
+    // DDL operations
+    async fn create_database(&self, profile: &ConnectionProfile, password: &str, name: &str, charset: Option<&str>, collation: Option<&str>) -> AppResult<()>;
+    async fn rename_database(&self, profile: &ConnectionProfile, password: &str, old_name: &str, new_name: &str) -> AppResult<()>;
+    async fn drop_database(&self, profile: &ConnectionProfile, password: &str, name: &str) -> AppResult<()>;
+    async fn create_schema(&self, profile: &ConnectionProfile, password: &str, database: &str, name: &str) -> AppResult<()>;
+    async fn rename_schema(&self, profile: &ConnectionProfile, password: &str, database: &str, old_name: &str, new_name: &str) -> AppResult<()>;
+    async fn drop_schema(&self, profile: &ConnectionProfile, password: &str, database: &str, name: &str) -> AppResult<()>;
+    async fn rename_table(&self, profile: &ConnectionProfile, password: &str, database: &str, schema: Option<&str>, old_name: &str, new_name: &str) -> AppResult<()>;
+
+    // Dump support
+    async fn dump_table_all_data(&self, profile: &ConnectionProfile, password: &str, table: &core_domain::TableRef) -> AppResult<core_domain::QueryResult>;
 }

@@ -8,3 +8,4 @@ license.workspace = true
 anyhow.workspace = true
 core-domain = { path = "../core-domain" }
 csv.workspace = true
+rust_xlsxwriter.workspace = true

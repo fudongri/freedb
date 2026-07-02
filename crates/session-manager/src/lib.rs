@@ -11,7 +11,7 @@ use core_domain::{
 use driver_api::DatabaseDriver;
 use parking_lot::RwLock;
 use ssh_tunnel::SshTunnelManager;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -27,6 +27,7 @@ pub struct SessionManager {
     pool: Arc<ConnectionPool>,
     ssh_tunnel: SshTunnelManager,
     statuses: Arc<RwLock<HashMap<String, SessionStatus>>>,
+    disconnected_by_user: Arc<RwLock<HashSet<String>>>,
     retry: RetryConfig,
 }
 
@@ -43,6 +44,7 @@ impl SessionManager {
             pool,
             ssh_tunnel: SshTunnelManager,
             statuses: Arc::new(RwLock::new(HashMap::new())),
+            disconnected_by_user: Arc::new(RwLock::new(HashSet::new())),
             retry,
         }
     }
@@ -254,13 +256,13 @@ impl SessionManager {
                 Err(e) => { last_err = Some(e); continue; }
             };
             let result = {
-                let guard = handle.lock().await;
+                let mut guard = handle.lock().await;
                 let d: &dyn DatabaseDriver = if guard.is_postgres() {
                     &self.pool.postgres
                 } else {
                     &self.pool.mysql
                 };
-                d.execute_sql(profile, password, execution.clone()).await
+                d.execute_sql(&mut guard, profile, password, execution.clone()).await
             };
             match result {
                 Ok(r) => { self.set_connected(&profile.id); return Ok(r); }
@@ -268,7 +270,7 @@ impl SessionManager {
                     self.pool.evict(&profile.id);
                     last_err = Some(e);
                 }
-                Err(e) => { self.set_failed(&profile.id, &e); return Err(e); }
+                Err(e) => { return Err(e); }
             }
         }
         let err = last_err.unwrap_or_else(|| AppError::Connection("retry exhausted".into()));
@@ -311,8 +313,75 @@ impl SessionManager {
         Err(last_err.unwrap_or_else(|| AppError::Connection("retry exhausted".into())))
     }
 
+    // ── DDL 操作 ──
+
+    pub async fn create_database(&self, profile: &ConnectionProfile, password: &str, name: &str, charset: Option<&str>, collation: Option<&str>) -> AppResult<()> {
+        self.driver(profile.kind).create_database(profile, password, name, charset, collation).await
+    }
+
+    pub async fn rename_database(&self, profile: &ConnectionProfile, password: &str, old_name: &str, new_name: &str) -> AppResult<()> {
+        self.driver(profile.kind).rename_database(profile, password, old_name, new_name).await
+    }
+
+    pub async fn drop_database(&self, profile: &ConnectionProfile, password: &str, name: &str) -> AppResult<()> {
+        self.driver(profile.kind).drop_database(profile, password, name).await
+    }
+
+    pub async fn create_schema(&self, profile: &ConnectionProfile, password: &str, database: &str, name: &str) -> AppResult<()> {
+        self.driver(profile.kind).create_schema(profile, password, database, name).await
+    }
+
+    pub async fn rename_schema(&self, profile: &ConnectionProfile, password: &str, database: &str, old_name: &str, new_name: &str) -> AppResult<()> {
+        self.driver(profile.kind).rename_schema(profile, password, database, old_name, new_name).await
+    }
+
+    pub async fn drop_schema(&self, profile: &ConnectionProfile, password: &str, database: &str, name: &str) -> AppResult<()> {
+        self.driver(profile.kind).drop_schema(profile, password, database, name).await
+    }
+
+    pub async fn rename_table(&self, profile: &ConnectionProfile, password: &str, database: &str, schema: Option<&str>, old_name: &str, new_name: &str) -> AppResult<()> {
+        self.driver(profile.kind).rename_table(profile, password, database, schema, old_name, new_name).await
+    }
+
+    pub async fn dump_table_all_data(
+        &self,
+        profile: &ConnectionProfile,
+        password: &str,
+        table: &TableRef,
+    ) -> AppResult<QueryResult> {
+        let mut last_err = None;
+        let db = table.database.clone().or_else(|| profile.default_database.clone());
+        for attempt in 0..=self.retry.max_retries {
+            if attempt > 0 { sleep(Duration::from_millis(self.backoff_ms(attempt))).await; }
+            let handle = match self.pool.acquire(profile, password, db.as_deref()).await {
+                Ok(h) => h,
+                Err(e) => { last_err = Some(e); continue; }
+            };
+            let result = {
+                let guard = handle.lock().await;
+                let d: &dyn DatabaseDriver = if guard.is_postgres() {
+                    &self.pool.postgres
+                } else {
+                    &self.pool.mysql
+                };
+                d.dump_table_all_data(profile, password, table).await
+            };
+            match result {
+                Ok(r) => return Ok(r),
+                Err(e) if self.is_retryable(&e) => {
+                    self.pool.evict(&profile.id);
+                    last_err = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| AppError::Connection("retry exhausted".into())))
+    }
+
     pub fn disconnect_connection(&self, connection_id: &str) {
         self.pool.evict(connection_id);
+        // 标记为用户主动断开，阻止残留异步任务把状态篡改回 Connected
+        self.disconnected_by_user.write().insert(connection_id.to_string());
         self.statuses.write().insert(
             connection_id.to_string(),
             SessionStatus { state: ConnectionState::Disconnected, last_error: None },
@@ -321,7 +390,16 @@ impl SessionManager {
 
     pub fn disconnect_all(&self) {
         self.pool.disconnect_all();
+        // 标记所有为用户主动断开
+        let ids: Vec<String> = self.statuses.read().keys().cloned().collect();
+        self.disconnected_by_user.write().extend(ids);
         self.statuses.write().clear();
+    }
+
+    /// 清除"用户主动断开"标记，在用户显式发起新连接前调用，
+    /// 允许后续 set_connected() 正常生效。
+    pub fn clear_user_disconnect(&self, connection_id: &str) {
+        self.disconnected_by_user.write().remove(connection_id);
     }
 
     pub fn connection_status(&self, connection_id: &str) -> SessionStatus {
@@ -335,6 +413,11 @@ impl SessionManager {
     }
 
     fn set_connected(&self, id: &str) {
+        // 不覆盖用户主动断开的状态：若该连接已被用户手动关闭，
+        // 此时若有残留异步任务完成，不应把状态篡改回 Connected。
+        if self.disconnected_by_user.read().contains(id) {
+            return;
+        }
         self.statuses.write().insert(id.to_string(), SessionStatus {
             state: ConnectionState::Connected, last_error: None,
         });
@@ -347,6 +430,10 @@ impl SessionManager {
     }
 
     fn set_reconnecting(&self, id: &str, error: Option<&AppError>) {
+        // 同 set_connected：不覆盖用户主动断开的状态
+        if self.disconnected_by_user.read().contains(id) {
+            return;
+        }
         self.statuses.write().insert(id.to_string(), SessionStatus {
             state: ConnectionState::Reconnecting, last_error: error.map(|e| e.to_string()),
         });

@@ -9,5 +9,6 @@ anyhow.workspace = true
 async-trait.workspace = true
 core-domain = { path = "../core-domain" }
 driver-api = { path = "../driver-api" }
+i18n = { path = "../i18n" }
 mysql_async.workspace = true
 tokio.workspace = true

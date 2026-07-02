@@ -18,6 +18,20 @@ impl DatabaseKind {
         }
     }
 
+    pub fn default_charset(self) -> &'static str {
+        match self {
+            Self::MySql => "utf8mb4",
+            Self::Postgres => "UTF8",
+        }
+    }
+
+    pub fn default_collation(self) -> &'static str {
+        match self {
+            Self::MySql => "utf8mb4_unicode_ci",
+            Self::Postgres => "",
+        }
+    }
+
     pub fn from_db_value(value: &str) -> Result<Self, AppError> {
         match value {
             "mysql" => Ok(Self::MySql),
@@ -214,6 +228,9 @@ pub struct ColumnDefinition {
     pub data_type: String,
     pub nullable: bool,
     pub primary_key: bool,
+    pub auto_increment: bool,
+    pub default_value: Option<String>,
+    pub comment: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

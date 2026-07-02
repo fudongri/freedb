@@ -5,6 +5,7 @@ use core_domain::{
     QueryCellValue, QueryExecution, QueryResult, TableChangeSet, TableDefinition, TableRef,
 };
 use driver_api::{ConnectionHandle, ConnectionProvider, DatabaseDriver};
+use i18n::tr;
 use mysql_async::{prelude::Queryable, Conn, OptsBuilder, Row, Value};
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -95,15 +96,21 @@ impl DatabaseDriver for MySqlDriver {
         let db = table.database.as_ref().ok_or_else(|| AppError::Validation("mysql table requires database".into()))?;
         let mut conn = open_conn(profile, password, Some(db)).await?;
         let sql = format!(
-            "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}' ORDER BY ORDINAL_POSITION",
+            "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT, COLUMN_COMMENT, EXTRA FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}' ORDER BY ORDINAL_POSITION",
             escape_mysql_literal(db), escape_mysql_literal(&table.table),
         );
         let rows: Vec<Row> = conn.query(sql).await.map_err(map_mysql_error)?;
-        let columns = rows.into_iter().map(|row| ColumnDefinition {
-            name: row.get::<String, _>(0).unwrap_or_default(),
-            data_type: row.get::<String, _>(1).unwrap_or_default(),
-            nullable: row.get::<String, _>(2).map(|v| v.eq_ignore_ascii_case("YES")).unwrap_or(true),
-            primary_key: row.get::<String, _>(3).map(|v| v.eq_ignore_ascii_case("PRI")).unwrap_or(false),
+        let columns = rows.into_iter().map(|row| {
+            let extra: String = row.get::<String, _>(6).unwrap_or_default();
+            ColumnDefinition {
+                name: row.get::<String, _>(0).unwrap_or_default(),
+                data_type: row.get::<String, _>(1).unwrap_or_default(),
+                nullable: row.get::<String, _>(2).map(|v| v.eq_ignore_ascii_case("YES")).unwrap_or(true),
+                primary_key: row.get::<String, _>(3).map(|v| v.eq_ignore_ascii_case("PRI")).unwrap_or(false),
+                auto_increment: extra.to_ascii_lowercase().contains("auto_increment"),
+                default_value: row.get::<Option<String>, _>(4).flatten().filter(|v| !v.is_empty()),
+                comment: row.get::<Option<String>, _>(5).flatten().filter(|v| !v.is_empty()),
+            }
         }).collect();
 
         let create_sql = if table.is_view {
@@ -130,15 +137,68 @@ impl DatabaseDriver for MySqlDriver {
         result
     }
 
-    async fn execute_sql(&self, profile: &ConnectionProfile, password: &str, execution: QueryExecution) -> AppResult<QueryResult> {
-        let mut conn = open_conn(profile, password, execution.database.as_deref().or(profile.default_database.as_deref())).await?;
-        let result = exec_on_conn(&mut conn, execution).await;
-        disconnect(conn).await;
-        result
+    async fn execute_sql(&self, handle: &mut ConnectionHandle, profile: &ConnectionProfile, password: &str, execution: QueryExecution) -> AppResult<QueryResult> {
+        match handle {
+            ConnectionHandle::MySql { conn } => exec_on_conn(conn, execution).await,
+            _ => Err(AppError::Validation("expected mysql handle".into())),
+        }
     }
 
     async fn apply_table_changes(&self, _profile: &ConnectionProfile, _password: &str, _changes: TableChangeSet) -> AppResult<QueryResult> {
-        Err(AppError::Unsupported("MySQL 表格编辑将在后续迭代中补全".into()))
+        Err(AppError::Unsupported(tr!("MySQL 表格编辑将在后续迭代中补全").to_string()))
+    }
+
+    async fn create_database(&self, profile: &ConnectionProfile, password: &str, name: &str, charset: Option<&str>, collation: Option<&str>) -> AppResult<()> {
+        let mut conn = open_conn(profile, password, profile.default_database.as_deref()).await?;
+        let mut sql = format!("CREATE DATABASE IF NOT EXISTS {}", quote_mysql(name));
+        if let Some(cs) = charset {
+            sql.push_str(&format!(" CHARACTER SET {}", cs));
+        }
+        if let Some(col) = collation {
+            sql.push_str(&format!(" COLLATE {}", col));
+        }
+        conn.query_drop(sql).await.map_err(map_mysql_error)?;
+        disconnect(conn).await;
+        Ok(())
+    }
+
+    async fn rename_database(&self, _profile: &ConnectionProfile, _password: &str, _old_name: &str, _new_name: &str) -> AppResult<()> {
+        Err(AppError::Unsupported(tr!("MySQL 不支持重命名数据库").to_string()))
+    }
+
+    async fn drop_database(&self, profile: &ConnectionProfile, password: &str, name: &str) -> AppResult<()> {
+        let mut conn = open_conn(profile, password, profile.default_database.as_deref()).await?;
+        conn.query_drop(format!("DROP DATABASE IF EXISTS {}", quote_mysql(name))).await.map_err(map_mysql_error)?;
+        disconnect(conn).await;
+        Ok(())
+    }
+
+    async fn create_schema(&self, _profile: &ConnectionProfile, _password: &str, _database: &str, _name: &str) -> AppResult<()> {
+        Err(AppError::Unsupported(tr!("MySQL 不支持 Schema").to_string()))
+    }
+
+    async fn rename_schema(&self, _profile: &ConnectionProfile, _password: &str, _database: &str, _old_name: &str, _new_name: &str) -> AppResult<()> {
+        Err(AppError::Unsupported(tr!("MySQL 不支持 Schema").to_string()))
+    }
+
+    async fn drop_schema(&self, _profile: &ConnectionProfile, _password: &str, _database: &str, _name: &str) -> AppResult<()> {
+        Err(AppError::Unsupported(tr!("MySQL 不支持 Schema").to_string()))
+    }
+
+    async fn rename_table(&self, profile: &ConnectionProfile, password: &str, database: &str, _schema: Option<&str>, old_name: &str, new_name: &str) -> AppResult<()> {
+        let mut conn = open_conn(profile, password, Some(database)).await?;
+        conn.query_drop(format!("RENAME TABLE {}.{} TO {}.{}", quote_mysql(database), quote_mysql(old_name), quote_mysql(database), quote_mysql(new_name))).await.map_err(map_mysql_error)?;
+        disconnect(conn).await;
+        Ok(())
+    }
+
+    async fn dump_table_all_data(&self, profile: &ConnectionProfile, password: &str, table: &core_domain::TableRef) -> AppResult<QueryResult> {
+        let db = table.database.as_ref().ok_or_else(|| AppError::Validation("mysql table requires database".into()))?;
+        let sql = format!("SELECT * FROM {}.{}", quote_mysql(db), quote_mysql(&table.table));
+        let mut conn = open_conn(profile, password, Some(db)).await?;
+        let result = query_rows(&mut conn, &sql).await;
+        disconnect(conn).await;
+        result
     }
 }
 
@@ -163,18 +223,25 @@ async fn exec_on_conn(conn: &mut Conn, execution: QueryExecution) -> AppResult<Q
         }
     }
     let lower = sql.to_ascii_lowercase();
-    if lower.starts_with("select") || lower.starts_with("show") || lower.starts_with("desc") || lower.starts_with("describe") || lower.starts_with("explain") {
+    if lower.starts_with("select") || lower.starts_with("show") || lower.starts_with("desc")
+        || lower.starts_with("describe") || lower.starts_with("explain") || lower.starts_with("execute")
+    {
         query_rows(conn, &sql).await
     } else {
-        conn.query_drop(sql).await.map_err(map_mysql_error)?;
-        Ok(QueryResult { columns: Vec::new(), rows: Vec::new(), affected_rows: Some(conn.affected_rows()), elapsed_ms: start.elapsed().as_millis(), message: Some("语句执行成功".into()) })
+        // 非查询语句：执行并丢弃所有结果集
+        {
+            let mut rs = conn.query_iter(&sql).await.map_err(map_mysql_error)?;
+            while let Some(_) = rs.next().await.map_err(map_mysql_error)? {}
+        }
+        Ok(QueryResult { columns: Vec::new(), rows: Vec::new(), affected_rows: Some(conn.affected_rows()), elapsed_ms: start.elapsed().as_millis(), message: Some(tr!("语句执行成功").to_string()) })
     }
 }
 
 async fn query_rows(conn: &mut Conn, sql: &str) -> AppResult<QueryResult> {
     let start = Instant::now();
-    let rows: Vec<Row> = conn.query(sql).await.map_err(map_mysql_error)?;
-    let columns = rows.first().map(|row| row.columns_ref().iter().map(|c| c.name_str().to_string()).collect::<Vec<_>>()).unwrap_or_default();
+    let mut result_set = conn.query_iter(sql).await.map_err(map_mysql_error)?;
+    let columns: Vec<String> = result_set.columns_ref().iter().map(|c| c.name_str().to_string()).collect();
+    let rows: Vec<Row> = result_set.collect().await.map_err(map_mysql_error)?;
     let mapped = rows.iter().map(|row| {
         let mut m = BTreeMap::new();
         for (i, col) in columns.iter().enumerate() {
@@ -200,5 +267,10 @@ fn mysql_cell(value: &Value) -> QueryCellValue {
 
 fn quote_mysql(s: &str) -> String { format!("`{}`", s.replace('`', "``")) }
 fn escape_mysql_literal(s: &str) -> String { s.replace('\\', "\\\\").replace('\'', "\\'") }
-fn map_mysql_error(e: mysql_async::Error) -> AppError { AppError::Connection(e.to_string()) }
+fn map_mysql_error(e: mysql_async::Error) -> AppError {
+    match &e {
+        mysql_async::Error::Server(_) => AppError::Query(e.to_string()),
+        _ => AppError::Connection(e.to_string()),
+    }
+}
 async fn disconnect(conn: Conn) { let _ = conn.disconnect().await.context("disconnect mysql"); }

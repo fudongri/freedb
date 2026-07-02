@@ -2,11 +2,13 @@ use anyhow::{anyhow, Result};
 use chrono::Utc;
 use connection_store::ConnectionStore;
 use core_domain::{
-    AppError, ConnectionProfile, ConnectionProfileInput, ExplorerNode, QueryExecution, QueryResult,
-    SavedQueryEntry, TableChangeSet, TableDefinition, TableRef, UiStateValue,
+    AppError, ConnectionProfile, ConnectionProfileInput, DatabaseKind, ExplorerNode,
+    ExplorerNodeType, QueryExecution, QueryResult, SavedQueryEntry, TableChangeSet,
+    TableDefinition, TableRef, UiStateValue,
 };
 use export_service::ExportService;
 use history_store::HistoryStore;
+use i18n::tr;
 use secure_store::SecureStore;
 use session_manager::{SessionManager, SessionStatus};
 use std::path::Path;
@@ -105,7 +107,7 @@ impl AppServices {
         let password = input
             .password
             .clone()
-            .ok_or_else(|| anyhow!("测试连接需要密码"))?;
+            .ok_or_else(|| anyhow!("{}", tr!("测试连接需要密码")))?;
         let mut profile = ConnectionProfile::from_input("test-connection".into(), input);
         profile.password_saved = false;
         self.session_manager
@@ -140,6 +142,33 @@ impl AppServices {
             .map(|n| n.name)
             .collect();
         Ok(databases)
+    }
+
+    /// Recursively load all Table/View nodes for a connection (does not rely on GUI cache).
+    pub async fn load_all_schema_tables(
+        &self,
+        connection_id: &str,
+    ) -> Result<Vec<(String, bool)>> {
+        let roots = self.load_connection_tree(connection_id).await?;
+        let mut result = Vec::new();
+        // BFS: Database → Schema (PG) → Table/View
+        let mut queue: Vec<ExplorerNode> = roots;
+        while let Some(node) = queue.pop() {
+            match node.node_type {
+                core_domain::ExplorerNodeType::Table | core_domain::ExplorerNodeType::View => {
+                    let is_view = matches!(node.node_type, core_domain::ExplorerNodeType::View);
+                    result.push((node.name, is_view));
+                }
+                _ => {
+                    let children = self
+                        .load_node_children(connection_id, &node)
+                        .await
+                        .unwrap_or_default();
+                    queue.extend(children);
+                }
+            }
+        }
+        Ok(result)
     }
 
     pub async fn load_node_children(
@@ -215,16 +244,19 @@ impl AppServices {
         let result = self
             .session_manager
             .execute_sql(&profile, &password, execution.clone())
-            .await
-            .map_err(into_anyhow)?;
-        if let Err(error) = self.history_store.append(&execution.connection_id, &execution.sql) {
+            .await;
+        let (elapsed_ms, success) = match &result {
+            Ok(r) => (r.elapsed_ms, true),
+            Err(_) => (0, false),
+        };
+        if let Err(error) = self.history_store.append(&execution.connection_id, &execution.sql, elapsed_ms, success) {
             warn!(
                 connection_id = execution.connection_id.as_str(),
                 error = %error,
                 "failed to persist query history"
             );
         }
-        Ok(result)
+        result.map_err(into_anyhow)
     }
 
     pub async fn apply_table_changes(&self, changes: TableChangeSet) -> Result<QueryResult> {
@@ -236,13 +268,14 @@ impl AppServices {
             .map_err(into_anyhow)
     }
 
-    pub fn list_query_history(&self, connection_id: &str) -> Result<Vec<String>> {
+    pub fn list_query_history(&self, connection_id: &str, limit: usize) -> Result<Vec<history_store::HistoryEntry>> {
         Ok(self
             .history_store
-            .list_by_connection(connection_id, 50)?
-            .into_iter()
-            .map(|entry| entry.sql_text)
-            .collect())
+            .list_by_connection(connection_id, limit)?)
+    }
+
+    pub fn clear_query_history(&self, connection_id: &str) -> Result<usize> {
+        Ok(self.history_store.clear_by_connection(connection_id)?)
     }
 
     pub fn save_query(
@@ -255,7 +288,7 @@ impl AppServices {
         let title = title.trim();
         let sql_text = sql_text.trim();
         if sql_text.is_empty() {
-            return Err(anyhow!("没有可保存的 SQL"));
+            return Err(anyhow!("{}", tr!("没有可保存的 SQL")));
         }
         let title = if title.is_empty() {
             build_saved_query_title(sql_text)
@@ -289,12 +322,36 @@ impl AppServices {
             .collect())
     }
 
+    pub fn list_all_saved_queries(&self) -> Result<Vec<SavedQueryEntry>> {
+        Ok(self
+            .history_store
+            .list_all_saved_queries(200)?
+            .into_iter()
+            .map(|record| SavedQueryEntry {
+                id: record.id,
+                connection_id: record.connection_id,
+                database: record.database,
+                title: record.title,
+                sql_text: record.sql_text,
+                saved_at: record.saved_at,
+            })
+            .collect())
+    }
+
     pub fn rename_saved_query(&self, id: &str, title: &str) -> Result<()> {
         let title = title.trim();
         if title.is_empty() {
-            return Err(anyhow!("查询名称不能为空"));
+            return Err(anyhow!("{}", tr!("查询名称不能为空")));
         }
         self.history_store.rename_saved_query(id, title)
+    }
+
+    pub fn update_saved_query(&self, id: &str, sql_text: &str, connection_id: &str, database: Option<&str>) -> Result<()> {
+        let sql_text = sql_text.trim();
+        if sql_text.is_empty() {
+            return Err(anyhow!("{}", tr!("SQL 内容不能为空")));
+        }
+        self.history_store.update_saved_query(id, sql_text, connection_id, database)
     }
 
     pub fn delete_saved_query(&self, id: &str) -> Result<()> {
@@ -309,6 +366,119 @@ impl AppServices {
         self.export_service.export_query_result_csv(result, path)
     }
 
+    pub fn export_query_result_xlsx(
+        &self,
+        result: &QueryResult,
+        path: impl AsRef<Path>,
+    ) -> Result<()> {
+        self.export_service.export_query_result_xlsx(result, path)
+    }
+
+    pub fn export_query_result_sql(
+        &self,
+        result: &QueryResult,
+        table_name: &str,
+        path: impl AsRef<Path>,
+    ) -> Result<()> {
+        self.export_service.export_query_result_sql(result, table_name, path)
+    }
+
+    /// Dump a single table's structure (and optionally data) as SQL.
+    pub async fn dump_table_sql(
+        &self,
+        table: &TableRef,
+        include_data: bool,
+        db_kind: DatabaseKind,
+    ) -> Result<String> {
+        let profile = self.require_connection(&table.connection_id)?;
+        let password = self.require_saved_password(&table.connection_id)?;
+
+        let table_def = self.session_manager.load_table_definition(&profile, &password, table).await.map_err(into_anyhow)?;
+
+        let data = if include_data {
+            Some(self.session_manager.dump_table_all_data(&profile, &password, table).await.map_err(into_anyhow)?)
+        } else {
+            None
+        };
+
+        let qualified_name = match db_kind {
+            DatabaseKind::Postgres => {
+                let schema = table.schema.as_deref().unwrap_or("public");
+                format!("{schema}.{}", table.table)
+            }
+            _ => table.table.clone(),
+        };
+
+        Ok(export_service::sql_dump::dump_table_sql(
+            &qualified_name,
+            &table_def,
+            data.as_ref(),
+            db_kind,
+            include_data,
+        ))
+    }
+
+    /// Dump all tables in a database as SQL.
+    pub async fn dump_database_sql(
+        &self,
+        connection_id: &str,
+        database: &str,
+        schema: Option<&str>,
+        include_data: bool,
+        db_kind: DatabaseKind,
+    ) -> Result<String> {
+        let profile = self.require_connection(connection_id)?;
+        let password = self.require_saved_password(connection_id)?;
+
+        // Build a parent node to list children (tables/views)
+        let parent = ExplorerNode {
+            id: String::new(),
+            connection_id: connection_id.to_string(),
+            name: database.to_string(),
+            node_type: ExplorerNodeType::Database,
+            parent_id: None,
+            database: Some(database.to_string()),
+            schema: schema.map(|s| s.to_string()),
+            expandable: true,
+            loaded: false,
+        };
+
+        let children = self.session_manager.load_node_children(&profile, &password, &parent).await.map_err(into_anyhow)?;
+
+        let mut tables = Vec::new();
+        for child in &children {
+            if !matches!(child.node_type, ExplorerNodeType::Table) {
+                continue; // skip views for now
+            }
+            let table_ref = TableRef {
+                connection_id: connection_id.to_string(),
+                database: Some(database.to_string()),
+                schema: child.schema.clone().or_else(|| schema.map(|s| s.to_string())),
+                table: child.name.clone(),
+                is_view: false,
+            };
+            let table_def = self.session_manager.load_table_definition(&profile, &password, &table_ref).await.map_err(into_anyhow)?;
+
+            let data = if include_data {
+                Some(self.session_manager.dump_table_all_data(&profile, &password, &table_ref).await.map_err(into_anyhow)?)
+            } else {
+                None
+            };
+
+            let qualified_name = match db_kind {
+                DatabaseKind::Postgres => {
+                    let s = table_ref.schema.as_deref().unwrap_or("public");
+                    format!("{s}.{}", table_ref.table)
+                }
+                _ => table_ref.table.clone(),
+            };
+
+            tables.push((qualified_name, table_def, data));
+        }
+
+        Ok(export_service::sql_dump::dump_database_sql(tables, db_kind, include_data))
+    }
+
     pub fn disconnect_connection(&self, connection_id: &str) {
         self.session_manager.disconnect_connection(connection_id);
     }
@@ -320,6 +490,54 @@ impl AppServices {
 
     pub fn connection_status(&self, connection_id: &str) -> SessionStatus {
         self.session_manager.connection_status(connection_id)
+    }
+
+    pub fn clear_user_disconnect(&self, connection_id: &str) {
+        self.session_manager.clear_user_disconnect(connection_id);
+    }
+
+    // ── DDL 操作 ──
+
+    pub async fn create_database(&self, connection_id: &str, name: &str, charset: Option<&str>, collation: Option<&str>) -> Result<()> {
+        let profile = self.require_connection(connection_id)?;
+        let password = self.require_saved_password(connection_id)?;
+        self.session_manager.create_database(&profile, &password, name, charset, collation).await.map_err(into_anyhow)
+    }
+
+    pub async fn rename_database(&self, connection_id: &str, old_name: &str, new_name: &str) -> Result<()> {
+        let profile = self.require_connection(connection_id)?;
+        let password = self.require_saved_password(connection_id)?;
+        self.session_manager.rename_database(&profile, &password, old_name, new_name).await.map_err(into_anyhow)
+    }
+
+    pub async fn drop_database(&self, connection_id: &str, name: &str) -> Result<()> {
+        let profile = self.require_connection(connection_id)?;
+        let password = self.require_saved_password(connection_id)?;
+        self.session_manager.drop_database(&profile, &password, name).await.map_err(into_anyhow)
+    }
+
+    pub async fn create_schema(&self, connection_id: &str, database: &str, name: &str) -> Result<()> {
+        let profile = self.require_connection(connection_id)?;
+        let password = self.require_saved_password(connection_id)?;
+        self.session_manager.create_schema(&profile, &password, database, name).await.map_err(into_anyhow)
+    }
+
+    pub async fn rename_schema(&self, connection_id: &str, database: &str, old_name: &str, new_name: &str) -> Result<()> {
+        let profile = self.require_connection(connection_id)?;
+        let password = self.require_saved_password(connection_id)?;
+        self.session_manager.rename_schema(&profile, &password, database, old_name, new_name).await.map_err(into_anyhow)
+    }
+
+    pub async fn drop_schema(&self, connection_id: &str, database: &str, name: &str) -> Result<()> {
+        let profile = self.require_connection(connection_id)?;
+        let password = self.require_saved_password(connection_id)?;
+        self.session_manager.drop_schema(&profile, &password, database, name).await.map_err(into_anyhow)
+    }
+
+    pub async fn rename_table(&self, connection_id: &str, database: &str, schema: Option<&str>, old_name: &str, new_name: &str) -> Result<()> {
+        let profile = self.require_connection(connection_id)?;
+        let password = self.require_saved_password(connection_id)?;
+        self.session_manager.rename_table(&profile, &password, database, schema, old_name, new_name).await.map_err(into_anyhow)
     }
 
     pub fn save_ui_state(&self, key: &str, value: &str) -> Result<()> {
@@ -353,19 +571,19 @@ impl AppServices {
     fn require_saved_password(&self, connection_id: &str) -> Result<String> {
         self.secure_store
             .load_password(connection_id)?
-            .ok_or_else(|| anyhow!("该连接未保存密码，请重新编辑连接后保存密码"))
+            .ok_or_else(|| anyhow!("{}", tr!("该连接未保存密码，请重新编辑连接后保存密码")))
     }
 }
 
 fn validate_connection_input(input: &ConnectionProfileInput) -> Result<()> {
     if input.name.trim().is_empty() {
-        return Err(anyhow!("连接名称不能为空"));
+        return Err(anyhow!("{}", tr!("连接名称不能为空")));
     }
     if input.host.trim().is_empty() {
-        return Err(anyhow!("主机地址不能为空"));
+        return Err(anyhow!("{}", tr!("主机地址不能为空")));
     }
     if input.username.trim().is_empty() {
-        return Err(anyhow!("用户名不能为空"));
+        return Err(anyhow!("{}", tr!("用户名不能为空")));
     }
     Ok(())
 }
@@ -379,13 +597,13 @@ fn build_saved_query_title(sql_text: &str) -> String {
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
-        .unwrap_or("未命名查询");
+        .unwrap_or("");
     let compact = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
     let char_count = compact.chars().count();
     if char_count > 36 {
         format!("{}...", compact.chars().take(36).collect::<String>())
     } else if compact.is_empty() {
-        "未命名查询".into()
+        tr!("未命名查询").to_string()
     } else {
         compact
     }

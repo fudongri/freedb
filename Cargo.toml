@@ -10,6 +10,7 @@ members = [
     "crates/driver-postgres",
     "crates/export-service",
     "crates/history-store",
+    "crates/i18n",
     "crates/secure-store",
     "crates/session-manager",
     "crates/ssh-tunnel",
@@ -31,11 +32,14 @@ eframe = "0.33"
 egui = "0.33"
 egui_dock = "0.18"
 egui_extras = "0.33"
+muda = "0.16"
 mysql_async = "0.36"
 parking_lot = "0.12"
 postgres-native-tls = "0.5"
 native-tls = "0.2"
+regex = "1"
 rfd = "0.15"
+rust_xlsxwriter = "0.84"
 rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
