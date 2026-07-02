@@ -15738,6 +15738,8 @@ fn render_query_editor(
                     .animated(false)
                     .show(ui, |ui| {
                         let editor_available_width = ui.available_width();
+                        // 估算可视区域能容纳的行数，确保 TextEdit 交互区填满整个编辑器
+                        let visible_rows = ((ui.available_height() / gutter_row_height).ceil() as usize).max(1);
                         let saved_cursor = tab.cursor_range;
                         // For multi-cursor edit replication: snapshot before TextEdit processes input.
                         // Clone sql BEFORE giving a &mut to TextEdit (avoids borrow conflict).
@@ -15782,9 +15784,10 @@ fn render_query_editor(
                             .font(FontId::new(15.0, FontFamily::Monospace))
                             .text_color(palette.text)
                             .margin(egui::Margin::ZERO)
-                            .frame(true)
+                            .frame(false)
                             .layouter(&mut layouter)
                             .desired_width(editor_available_width)
+                            .desired_rows(visible_rows)
                             .hint_text("");
                         let mut output = te.show(ui);
 
