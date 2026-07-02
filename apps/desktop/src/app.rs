@@ -7595,16 +7595,37 @@ async fn check_for_update() -> Option<UpdateInfo> {
 }
 
 impl eframe::App for DesktopApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // 延迟初始化原生菜单栏：winit 启动时会创建默认菜单，
         // 必须在第一帧 update() 时才挂载我们的菜单，否则会被覆盖。
-        #[cfg(target_os = "macos")]
         if !self.native_menu_initialized {
             if let Some(ref menu) = self.native_menu {
-                tracing::info!("正在初始化原生菜单栏...");
-                menu.init_for_nsapp();
-                self.native_menu_initialized = true;
-                tracing::info!("原生菜单栏初始化完成");
+                #[cfg(target_os = "macos")]
+                {
+                    tracing::info!("正在初始化原生菜单栏...");
+                    menu.init_for_nsapp();
+                    self.native_menu_initialized = true;
+                    tracing::info!("原生菜单栏初始化完成");
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    use raw_window_handle::HasWindowHandle;
+                    if let Ok(handle) = frame.window_handle() {
+                        if let raw_window_handle::RawWindowHandle::Win32(h) = handle.as_raw() {
+                            let hwnd = h.hwnd.get() as isize;
+                            unsafe {
+                                menu.init_for_hwnd(hwnd);
+                                menu.attach_menu_subclass_for_hwnd(hwnd);
+                            }
+                            self.native_menu_initialized = true;
+                            tracing::info!("原生菜单栏初始化完成 (Windows)");
+                        }
+                    }
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                {
+                    self.native_menu_initialized = true;
+                }
             } else {
                 tracing::warn!("native_menu 为 None");
             }
